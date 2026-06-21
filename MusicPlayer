@@ -1,0 +1,462 @@
+-- Spotify-style DFPWM music player for CC:Tweaked
+-- Drop .dfpwm files directly into the computer root: /song.dfpwm
+-- Run with: radio
+-- Save this file as /radio.lua
+
+local speaker = peripheral.find("speaker")
+if not speaker then
+    error("No speaker attached. Put a speaker next to the computer.")
+end
+
+local dfpwm = require("cc.audio.dfpwm")
+
+local state = {
+    running = true,
+    playing = false,
+    current = 1,
+    scroll = 0,
+    volume = 1.0,
+    shuffle = false,
+    loopTrack = false,
+    token = 0,
+    status = "Stopped",
+}
+
+local tracks = {}
+local buttons = {}
+
+local function clamp(n, min, max)
+    if n < min then return min end
+    if n > max then return max end
+    return n
+end
+
+local function shortName(name)
+    return name:gsub("%.dfpwm$", ""):gsub("%.DFPWM$", "")
+end
+
+local function scanTracks()
+    tracks = {}
+
+    for _, name in ipairs(fs.list("/")) do
+        local path = "/" .. name
+        if not fs.isDir(path) and name:lower():match("%.dfpwm$") then
+            table.insert(tracks, {
+                name = name,
+                display = shortName(name),
+                path = path,
+            })
+        end
+    end
+
+    table.sort(tracks, function(a, b)
+        return a.name:lower() < b.name:lower()
+    end)
+
+    if #tracks == 0 then
+        state.current = 1
+        state.scroll = 0
+    else
+        state.current = clamp(state.current, 1, #tracks)
+        state.scroll = clamp(state.scroll, 0, math.max(0, #tracks - 1))
+    end
+end
+
+local function trim(text, width)
+    text = tostring(text or "")
+    if #text <= width then
+        return text .. string.rep(" ", width - #text)
+    end
+    if width <= 3 then
+        return text:sub(1, width)
+    end
+    return text:sub(1, width - 3) .. "..."
+end
+
+local function writeAt(x, y, text, fg, bg)
+    if fg then term.setTextColor(fg) end
+    if bg then term.setBackgroundColor(bg) end
+    term.setCursorPos(x, y)
+    write(text)
+end
+
+local function clearLine(y, bg)
+    local w = term.getSize()
+    term.setCursorPos(1, y)
+    term.setBackgroundColor(bg or colors.black)
+    write(string.rep(" ", w))
+end
+
+local function addButton(id, x, y, w, label, fg, bg)
+    buttons[id] = {
+        x = x,
+        y = y,
+        w = w,
+        h = 1,
+        label = label,
+        fg = fg or colors.white,
+        bg = bg or colors.gray,
+    }
+
+    writeAt(x, y, trim(label, w), fg or colors.white, bg or colors.gray)
+end
+
+local function buttonAt(x, y)
+    for id, b in pairs(buttons) do
+        if x >= b.x and x < b.x + b.w and y >= b.y and y < b.y + b.h then
+            return id
+        end
+    end
+    return nil
+end
+
+local function visibleTrackArea()
+    local w, h = term.getSize()
+    return 6, h - 4
+end
+
+local function ensureCurrentVisible()
+    local top, bottom = visibleTrackArea()
+    local rows = bottom - top + 1
+
+    if state.current - 1 < state.scroll then
+        state.scroll = state.current - 1
+    elseif state.current > state.scroll + rows then
+        state.scroll = state.current - rows
+    end
+
+    state.scroll = clamp(state.scroll, 0, math.max(0, #tracks - rows))
+end
+
+local function draw()
+    buttons = {}
+    local w, h = term.getSize()
+
+    term.setBackgroundColor(colors.black)
+    term.setTextColor(colors.white)
+    term.clear()
+
+    -- Header
+    clearLine(1, colors.gray)
+    writeAt(2, 1, "JARVIS RADIO", colors.white, colors.gray)
+    writeAt(w - 12, 1, "DFPWM FM", colors.lightGray, colors.gray)
+
+    -- Now playing panel
+    local currentTrack = tracks[state.current]
+    local title = currentTrack and currentTrack.display or "No tracks found"
+
+    writeAt(2, 3, "Now Playing", colors.lightGray, colors.black)
+    writeAt(2, 4, trim(title, w - 4), state.playing and colors.lime or colors.white, colors.black)
+
+    local info = "Status: " .. state.status ..
+        "  |  Volume: " .. string.format("%.1f", state.volume) ..
+        "  |  Shuffle: " .. (state.shuffle and "ON" or "OFF") ..
+        "  |  Loop: " .. (state.loopTrack and "ON" or "OFF")
+
+    writeAt(2, 5, trim(info, w - 4), colors.lightGray, colors.black)
+
+    -- Track list
+    local listTop, listBottom = visibleTrackArea()
+    local rows = listBottom - listTop + 1
+
+    for row = 1, rows do
+        local y = listTop + row - 1
+        clearLine(y, colors.black)
+
+        local index = state.scroll + row
+        local track = tracks[index]
+
+        if track then
+            local isCurrent = index == state.current
+            local prefix = isCurrent and "> " or "  "
+            local fg = isCurrent and colors.black or colors.white
+            local bg = isCurrent and colors.lime or colors.black
+
+            writeAt(2, y, trim(prefix .. track.display, w - 4), fg, bg)
+        end
+    end
+
+    if #tracks == 0 then
+        writeAt(2, listTop, "Drop .dfpwm files directly into / then press Refresh.", colors.yellow, colors.black)
+    end
+
+    -- Bottom controls
+    clearLine(h - 2, colors.gray)
+    clearLine(h - 1, colors.gray)
+    clearLine(h, colors.gray)
+
+    local y = h - 1
+    local x = 2
+
+    addButton("prev", x, y, 8, " Prev ", colors.white, colors.gray)
+    x = x + 9
+
+    if state.playing then
+        addButton("stop", x, y, 8, " Stop ", colors.white, colors.red)
+    else
+        addButton("play", x, y, 8, " Play ", colors.white, colors.green)
+    end
+    x = x + 9
+
+    addButton("next", x, y, 8, " Next ", colors.white, colors.gray)
+    x = x + 9
+
+    addButton("shuffle", x, y, 11, state.shuffle and " Shuffle*" or " Shuffle ", colors.white, state.shuffle and colors.purple or colors.gray)
+    x = x + 12
+
+    addButton("loop", x, y, 8, state.loopTrack and " Loop*" or " Loop ", colors.white, state.loopTrack and colors.blue or colors.gray)
+    x = x + 9
+
+    addButton("voldown", x, y, 5, " - ", colors.white, colors.gray)
+    x = x + 6
+
+    addButton("volup", x, y, 5, " + ", colors.white, colors.gray)
+    x = x + 6
+
+    if x + 10 <= w then
+        addButton("refresh", x, y, 10, " Refresh ", colors.white, colors.gray)
+    end
+
+    writeAt(2, h, "Click a track to play. Mouse wheel scrolls.", colors.lightGray, colors.gray)
+end
+
+local function wake()
+    os.queueEvent("radio_wake")
+    os.queueEvent("radio_redraw")
+end
+
+local function stopPlayback()
+    state.playing = false
+    state.status = "Stopped"
+    state.token = state.token + 1
+    speaker.stop()
+    wake()
+end
+
+local function playCurrent()
+    if #tracks == 0 then
+        state.status = "No tracks"
+        wake()
+        return
+    end
+
+    state.current = clamp(state.current, 1, #tracks)
+    ensureCurrentVisible()
+
+    state.playing = true
+    state.status = "Playing"
+    state.token = state.token + 1
+    speaker.stop()
+    wake()
+end
+
+local function nextTrack()
+    if #tracks == 0 then return end
+
+    if state.shuffle and #tracks > 1 then
+        local old = state.current
+        repeat
+            state.current = math.random(1, #tracks)
+        until state.current ~= old
+    else
+        state.current = state.current + 1
+        if state.current > #tracks then
+            state.current = 1
+        end
+    end
+
+    playCurrent()
+end
+
+local function previousTrack()
+    if #tracks == 0 then return end
+
+    state.current = state.current - 1
+    if state.current < 1 then
+        state.current = #tracks
+    end
+
+    playCurrent()
+end
+
+local function afterTrackFinished()
+    if #tracks == 0 then
+        stopPlayback()
+        return
+    end
+
+    if state.loopTrack then
+        playCurrent()
+        return
+    end
+
+    if state.shuffle then
+        nextTrack()
+        return
+    end
+
+    if state.current < #tracks then
+        state.current = state.current + 1
+        playCurrent()
+    else
+        state.playing = false
+        state.status = "Stopped"
+        speaker.stop()
+        wake()
+    end
+end
+
+local function audioThread()
+    while state.running do
+        if not state.playing or #tracks == 0 then
+            os.pullEvent("radio_wake")
+        else
+            local track = tracks[state.current]
+            local token = state.token
+
+            if not track or not fs.exists(track.path) then
+                state.status = "Missing file"
+                state.playing = false
+                wake()
+            else
+                state.status = "Playing"
+                wake()
+
+                local decoder = dfpwm.make_decoder()
+                local finishedNaturally = true
+
+                for chunk in io.lines(track.path, 16 * 1024) do
+                    if not state.playing or token ~= state.token then
+                        finishedNaturally = false
+                        break
+                    end
+
+                    local buffer = decoder(chunk)
+
+                    while not speaker.playAudio(buffer, state.volume) do
+                        if not state.playing or token ~= state.token then
+                            finishedNaturally = false
+                            break
+                        end
+                        os.pullEvent("speaker_audio_empty")
+                    end
+
+                    if not finishedNaturally then
+                        break
+                    end
+                end
+
+                if finishedNaturally and state.playing and token == state.token then
+                    speaker.stop()
+                    afterTrackFinished()
+                end
+            end
+        end
+    end
+end
+
+local function handleButton(id)
+    if id == "play" then
+        playCurrent()
+
+    elseif id == "stop" then
+        stopPlayback()
+
+    elseif id == "next" then
+        nextTrack()
+
+    elseif id == "prev" then
+        previousTrack()
+
+    elseif id == "shuffle" then
+        state.shuffle = not state.shuffle
+        wake()
+
+    elseif id == "loop" then
+        state.loopTrack = not state.loopTrack
+        wake()
+
+    elseif id == "voldown" then
+        state.volume = clamp(state.volume - 0.1, 0.0, 3.0)
+        wake()
+
+    elseif id == "volup" then
+        state.volume = clamp(state.volume + 0.1, 0.0, 3.0)
+        wake()
+
+    elseif id == "refresh" then
+        local oldName = tracks[state.current] and tracks[state.current].name
+        scanTracks()
+
+        if oldName then
+            for i, track in ipairs(tracks) do
+                if track.name == oldName then
+                    state.current = i
+                    break
+                end
+            end
+        end
+
+        ensureCurrentVisible()
+        wake()
+    end
+end
+
+local function uiThread()
+    draw()
+
+    while state.running do
+        local event, a, b, c = os.pullEvent()
+
+        if event == "radio_redraw" or event == "term_resize" then
+            draw()
+
+        elseif event == "mouse_scroll" then
+            local direction = a
+            local listTop, listBottom = visibleTrackArea()
+            local rows = listBottom - listTop + 1
+
+            state.scroll = clamp(
+                state.scroll + direction,
+                0,
+                math.max(0, #tracks - rows)
+            )
+
+            draw()
+
+        elseif event == "mouse_click" then
+            local button, x, y = a, b, c
+            local id = buttonAt(x, y)
+
+            if id then
+                handleButton(id)
+                draw()
+            else
+                local listTop, listBottom = visibleTrackArea()
+
+                if y >= listTop and y <= listBottom then
+                    local index = state.scroll + (y - listTop + 1)
+
+                    if tracks[index] then
+                        state.current = index
+                        playCurrent()
+                        draw()
+                    end
+                end
+            end
+        end
+    end
+end
+
+math.randomseed(os.epoch("utc"))
+scanTracks()
+ensureCurrentVisible()
+
+parallel.waitForAny(audioThread, uiThread)
+
+speaker.stop()
+term.setBackgroundColor(colors.black)
+term.setTextColor(colors.white)
+term.clear()
+term.setCursorPos(1, 1)
+print("JARVIS Radio closed.")
