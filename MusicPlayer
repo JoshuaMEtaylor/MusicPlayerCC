@@ -1,11 +1,28 @@
--- Spotify-style DFPWM music player for CC:Tweaked
--- Drop .dfpwm files directly into the computer root: /song.dfpwm
--- Run with: radio
--- Save this file as /radio.lua
+-- JARVIS Radio Stream Player for CC:Tweaked
+-- Streams .dfpwm files directly from a GitHub repo.
+-- Save as: MusicPlayer
+-- Run with: MusicPlayer
+--
+-- Repo expected:
+-- https://github.com/JoshuaMEtaylor/MusicPlayerCC/tree/main
+--
+-- Everything ending in .dfpwm in the repo root is treated as a song.
+-- The file named MusicPlayer is ignored.
+
+local USER = "JoshuaMEtaylor"
+local REPO = "MusicPlayerCC"
+local BRANCH = "main"
+
+local API_URL = "https://api.github.com/repos/" .. USER .. "/" .. REPO .. "/contents?ref=" .. BRANCH
+local RAW_BASE = "https://raw.githubusercontent.com/" .. USER .. "/" .. REPO .. "/" .. BRANCH .. "/"
 
 local speaker = peripheral.find("speaker")
 if not speaker then
     error("No speaker attached. Put a speaker next to the computer.")
+end
+
+if not http then
+    error("HTTP API is not enabled on this server.")
 end
 
 local dfpwm = require("cc.audio.dfpwm")
@@ -19,7 +36,8 @@ local state = {
     shuffle = false,
     loopTrack = false,
     token = 0,
-    status = "Stopped",
+    status = "Loading repo...",
+    errorText = nil,
 }
 
 local tracks = {}
@@ -31,39 +49,24 @@ local function clamp(n, min, max)
     return n
 end
 
-local function shortName(name)
-    return name:gsub("%.dfpwm$", ""):gsub("%.DFPWM$", "")
+local function urlEncodePath(s)
+    return tostring(s)
+        :gsub("([^%w%-%._~/])", function(c)
+            return string.format("%%%02X", string.byte(c))
+        end)
 end
 
-local function scanTracks()
-    tracks = {}
-
-    for _, name in ipairs(fs.list("/")) do
-        local path = "/" .. name
-        if not fs.isDir(path) and name:lower():match("%.dfpwm$") then
-            table.insert(tracks, {
-                name = name,
-                display = shortName(name),
-                path = path,
-            })
-        end
-    end
-
-    table.sort(tracks, function(a, b)
-        return a.name:lower() < b.name:lower()
-    end)
-
-    if #tracks == 0 then
-        state.current = 1
-        state.scroll = 0
-    else
-        state.current = clamp(state.current, 1, #tracks)
-        state.scroll = clamp(state.scroll, 0, math.max(0, #tracks - 1))
-    end
+local function niceName(fileName)
+    local name = tostring(fileName or "")
+    name = name:gsub("%.dfpwm$", ""):gsub("%.DFPWM$", "")
+    name = name:gsub("%%20", " ")
+    name = name:gsub("%s+", " ")
+    return name
 end
 
 local function trim(text, width)
     text = tostring(text or "")
+    if width <= 0 then return "" end
     if #text <= width then
         return text .. string.rep(" ", width - #text)
     end
@@ -112,12 +115,14 @@ end
 
 local function visibleTrackArea()
     local w, h = term.getSize()
-    return 6, h - 4
+    return 7, h - 4
 end
 
 local function ensureCurrentVisible()
     local top, bottom = visibleTrackArea()
     local rows = bottom - top + 1
+
+    if rows < 1 then return end
 
     if state.current - 1 < state.scroll then
         state.scroll = state.current - 1
@@ -128,6 +133,87 @@ local function ensureCurrentVisible()
     state.scroll = clamp(state.scroll, 0, math.max(0, #tracks - rows))
 end
 
+local function wake()
+    os.queueEvent("radio_wake")
+    os.queueEvent("radio_redraw")
+end
+
+local function githubRequest(url)
+    -- GitHub sometimes behaves better with a User-Agent header.
+    local headers = {
+        ["User-Agent"] = "CC-Tweaked-JARVIS-Radio",
+        ["Accept"] = "application/vnd.github+json",
+    }
+
+    return http.get(url, headers)
+end
+
+local function loadTracksFromRepo()
+    state.status = "Refreshing repo..."
+    state.errorText = nil
+    wake()
+
+    local handle = githubRequest(API_URL)
+    if not handle then
+        state.status = "Repo failed"
+        state.errorText = "Could not reach GitHub API. HTTP may be disabled or blocked."
+        wake()
+        return false
+    end
+
+    local body = handle.readAll()
+    handle.close()
+
+    local data = textutils.unserializeJSON(body)
+    if type(data) ~= "table" then
+        state.status = "Bad repo data"
+        state.errorText = "GitHub did not return usable JSON."
+        wake()
+        return false
+    end
+
+    local newTracks = {}
+
+    for _, item in ipairs(data) do
+        if type(item) == "table" and item.type == "file" and type(item.name) == "string" then
+            local lower = item.name:lower()
+
+            if lower:match("%.dfpwm$") then
+                local rawUrl = RAW_BASE .. urlEncodePath(item.name)
+
+                table.insert(newTracks, {
+                    name = item.name,
+                    display = niceName(item.name),
+                    url = rawUrl,
+                    size = item.size or 0,
+                })
+            end
+        end
+    end
+
+    table.sort(newTracks, function(a, b)
+        return a.display:lower() < b.display:lower()
+    end)
+
+    tracks = newTracks
+
+    if #tracks == 0 then
+        state.current = 1
+        state.scroll = 0
+        state.status = "No tracks"
+        state.errorText = "No .dfpwm files found in the repo root."
+    else
+        state.current = clamp(state.current, 1, #tracks)
+        state.scroll = clamp(state.scroll, 0, math.max(0, #tracks - 1))
+        state.status = "Ready"
+        state.errorText = nil
+    end
+
+    ensureCurrentVisible()
+    wake()
+    return true
+end
+
 local function draw()
     buttons = {}
     local w, h = term.getSize()
@@ -136,12 +222,10 @@ local function draw()
     term.setTextColor(colors.white)
     term.clear()
 
-    -- Header
     clearLine(1, colors.gray)
     writeAt(2, 1, "JARVIS RADIO", colors.white, colors.gray)
-    writeAt(w - 12, 1, "DFPWM FM", colors.lightGray, colors.gray)
+    writeAt(w - 14, 1, "GITHUB FM", colors.lightGray, colors.gray)
 
-    -- Now playing panel
     local currentTrack = tracks[state.current]
     local title = currentTrack and currentTrack.display or "No tracks found"
 
@@ -149,13 +233,19 @@ local function draw()
     writeAt(2, 4, trim(title, w - 4), state.playing and colors.lime or colors.white, colors.black)
 
     local info = "Status: " .. state.status ..
-        "  |  Volume: " .. string.format("%.1f", state.volume) ..
-        "  |  Shuffle: " .. (state.shuffle and "ON" or "OFF") ..
-        "  |  Loop: " .. (state.loopTrack and "ON" or "OFF")
+        " | Vol: " .. string.format("%.1f", state.volume) ..
+        " | Shuffle: " .. (state.shuffle and "ON" or "OFF") ..
+        " | Loop: " .. (state.loopTrack and "ON" or "OFF") ..
+        " | Tracks: " .. tostring(#tracks)
 
     writeAt(2, 5, trim(info, w - 4), colors.lightGray, colors.black)
 
-    -- Track list
+    if state.errorText then
+        writeAt(2, 6, trim(state.errorText, w - 4), colors.red, colors.black)
+    else
+        writeAt(2, 6, trim("Streaming from: " .. USER .. "/" .. REPO, w - 4), colors.gray, colors.black)
+    end
+
     local listTop, listBottom = visibleTrackArea()
     local rows = listBottom - listTop + 1
 
@@ -176,11 +266,6 @@ local function draw()
         end
     end
 
-    if #tracks == 0 then
-        writeAt(2, listTop, "Drop .dfpwm files directly into / then press Refresh.", colors.yellow, colors.black)
-    end
-
-    -- Bottom controls
     clearLine(h - 2, colors.gray)
     clearLine(h - 1, colors.gray)
     clearLine(h, colors.gray)
@@ -188,41 +273,36 @@ local function draw()
     local y = h - 1
     local x = 2
 
-    addButton("prev", x, y, 8, " Prev ", colors.white, colors.gray)
-    x = x + 9
+    addButton("prev", x, y, 7, " Prev ", colors.white, colors.gray)
+    x = x + 8
 
     if state.playing then
-        addButton("stop", x, y, 8, " Stop ", colors.white, colors.red)
+        addButton("stop", x, y, 7, " Stop ", colors.white, colors.red)
     else
-        addButton("play", x, y, 8, " Play ", colors.white, colors.green)
+        addButton("play", x, y, 7, " Play ", colors.white, colors.green)
     end
-    x = x + 9
+    x = x + 8
 
-    addButton("next", x, y, 8, " Next ", colors.white, colors.gray)
-    x = x + 9
+    addButton("next", x, y, 7, " Next ", colors.white, colors.gray)
+    x = x + 8
 
-    addButton("shuffle", x, y, 11, state.shuffle and " Shuffle*" or " Shuffle ", colors.white, state.shuffle and colors.purple or colors.gray)
-    x = x + 12
+    addButton("shuffle", x, y, 10, state.shuffle and "Shuffle*" or "Shuffle ", colors.white, state.shuffle and colors.purple or colors.gray)
+    x = x + 11
 
-    addButton("loop", x, y, 8, state.loopTrack and " Loop*" or " Loop ", colors.white, state.loopTrack and colors.blue or colors.gray)
-    x = x + 9
+    addButton("loop", x, y, 7, state.loopTrack and "Loop*" or "Loop ", colors.white, state.loopTrack and colors.blue or colors.gray)
+    x = x + 8
 
-    addButton("voldown", x, y, 5, " - ", colors.white, colors.gray)
-    x = x + 6
+    addButton("voldown", x, y, 4, " - ", colors.white, colors.gray)
+    x = x + 5
 
-    addButton("volup", x, y, 5, " + ", colors.white, colors.gray)
-    x = x + 6
+    addButton("volup", x, y, 4, " + ", colors.white, colors.gray)
+    x = x + 5
 
-    if x + 10 <= w then
-        addButton("refresh", x, y, 10, " Refresh ", colors.white, colors.gray)
+    if x + 9 <= w then
+        addButton("refresh", x, y, 9, "Refresh", colors.white, colors.gray)
     end
 
-    writeAt(2, h, "Click a track to play. Mouse wheel scrolls.", colors.lightGray, colors.gray)
-end
-
-local function wake()
-    os.queueEvent("radio_wake")
-    os.queueEvent("radio_redraw")
+    writeAt(2, h, "Click track to stream. Mouse wheel scrolls. Ctrl+T exits.", colors.lightGray, colors.gray)
 end
 
 local function stopPlayback()
@@ -244,7 +324,8 @@ local function playCurrent()
     ensureCurrentVisible()
 
     state.playing = true
-    state.status = "Playing"
+    state.status = "Connecting..."
+    state.errorText = nil
     state.token = state.token + 1
     speaker.stop()
     wake()
@@ -306,6 +387,14 @@ local function afterTrackFinished()
     end
 end
 
+local function openStream(url)
+    -- Binary mode is important here. Without true as third arg,
+    -- some servers/versions can mangle binary-ish data.
+    return http.get(url, {
+        ["User-Agent"] = "CC-Tweaked-JARVIS-Radio",
+    }, true)
+end
+
 local function audioThread()
     while state.running do
         if not state.playing or #tracks == 0 then
@@ -314,41 +403,64 @@ local function audioThread()
             local track = tracks[state.current]
             local token = state.token
 
-            if not track or not fs.exists(track.path) then
-                state.status = "Missing file"
+            if not track then
+                state.status = "Missing track"
                 state.playing = false
                 wake()
             else
-                state.status = "Playing"
+                state.status = "Connecting..."
+                state.errorText = nil
                 wake()
 
-                local decoder = dfpwm.make_decoder()
-                local finishedNaturally = true
+                local handle = openStream(track.url)
 
-                for chunk in io.lines(track.path, 16 * 1024) do
-                    if not state.playing or token ~= state.token then
-                        finishedNaturally = false
-                        break
+                if not handle then
+                    if state.playing and token == state.token then
+                        state.status = "Stream failed"
+                        state.errorText = "Could not open track URL."
+                        state.playing = false
+                        speaker.stop()
+                        wake()
                     end
+                else
+                    state.status = "Playing"
+                    wake()
 
-                    local buffer = decoder(chunk)
+                    local decoder = dfpwm.make_decoder()
+                    local finishedNaturally = true
 
-                    while not speaker.playAudio(buffer, state.volume) do
+                    while true do
                         if not state.playing or token ~= state.token then
                             finishedNaturally = false
                             break
                         end
-                        os.pullEvent("speaker_audio_empty")
+
+                        local chunk = handle.read(16 * 1024)
+                        if not chunk then
+                            break
+                        end
+
+                        local buffer = decoder(chunk)
+
+                        while not speaker.playAudio(buffer, state.volume) do
+                            if not state.playing or token ~= state.token then
+                                finishedNaturally = false
+                                break
+                            end
+                            os.pullEvent("speaker_audio_empty")
+                        end
+
+                        if not finishedNaturally then
+                            break
+                        end
                     end
 
-                    if not finishedNaturally then
-                        break
-                    end
-                end
+                    handle.close()
 
-                if finishedNaturally and state.playing and token == state.token then
-                    speaker.stop()
-                    afterTrackFinished()
+                    if finishedNaturally and state.playing and token == state.token then
+                        speaker.stop()
+                        afterTrackFinished()
+                    end
                 end
             end
         end
@@ -386,7 +498,7 @@ local function handleButton(id)
 
     elseif id == "refresh" then
         local oldName = tracks[state.current] and tracks[state.current].name
-        scanTracks()
+        loadTracksFromRepo()
 
         if oldName then
             for i, track in ipairs(tracks) do
@@ -449,8 +561,8 @@ local function uiThread()
 end
 
 math.randomseed(os.epoch("utc"))
-scanTracks()
-ensureCurrentVisible()
+
+loadTracksFromRepo()
 
 parallel.waitForAny(audioThread, uiThread)
 
