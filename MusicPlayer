@@ -1,20 +1,21 @@
--- JARVIS Radio Stream Player for CC:Tweaked
--- Streams .dfpwm files directly from a GitHub repo.
--- Save as: MusicPlayer
--- Run with: MusicPlayer
+-- JARVIS Radio GitHub Stream Player - Diagnostic Build
+-- Save this file on GitHub as: MusicPlayer
+-- Then in ComputerCraft:
+--   wget "https://raw.githubusercontent.com/JoshuaMEtaylor/MusicPlayerCC/main/MusicPlayer" MusicPlayer
+--   MusicPlayer
 --
--- Repo expected:
--- https://github.com/JoshuaMEtaylor/MusicPlayerCC/tree/main
---
--- Everything ending in .dfpwm in the repo root is treated as a song.
--- The file named MusicPlayer is ignored.
+-- This version streams .dfpwm tracks from your GitHub repo without saving them locally.
+-- It also shows a visible log/debug panel so you can see what is happening.
 
 local USER = "JoshuaMEtaylor"
 local REPO = "MusicPlayerCC"
 local BRANCH = "main"
 
+-- Uses the same GitHub raw style that worked when wget connected earlier.
+local REPO_PAGE_URL = "https://github.com/" .. USER .. "/" .. REPO .. "/tree/" .. BRANCH
 local API_URL = "https://api.github.com/repos/" .. USER .. "/" .. REPO .. "/contents?ref=" .. BRANCH
-local RAW_BASE = "https://raw.githubusercontent.com/" .. USER .. "/" .. REPO .. "/" .. BRANCH .. "/"
+local RAW_BASE_GITHUB = "https://github.com/" .. USER .. "/" .. REPO .. "/raw/refs/heads/" .. BRANCH .. "/"
+local RAW_BASE_RAWGITHUB = "https://raw.githubusercontent.com/" .. USER .. "/" .. REPO .. "/" .. BRANCH .. "/"
 
 local speaker = peripheral.find("speaker")
 if not speaker then
@@ -36,12 +37,25 @@ local state = {
     shuffle = false,
     loopTrack = false,
     token = 0,
-    status = "Loading repo...",
-    errorText = nil,
+    status = "Booting...",
+    lastError = "",
+    useGithubRaw = true,
+    drawRequested = false,
 }
 
 local tracks = {}
 local buttons = {}
+local logs = {}
+
+local function addLog(msg)
+    msg = tostring(msg or "")
+    local stamp = textutils.formatTime(os.time(), true)
+    table.insert(logs, "[" .. stamp .. "] " .. msg)
+    while #logs > 8 do
+        table.remove(logs, 1)
+    end
+    os.queueEvent("radio_redraw")
+end
 
 local function clamp(n, min, max)
     if n < min then return min end
@@ -49,7 +63,7 @@ local function clamp(n, min, max)
     return n
 end
 
-local function urlEncodePath(s)
+local function encodePath(s)
     return tostring(s)
         :gsub("([^%w%-%._~/])", function(c)
             return string.format("%%%02X", string.byte(c))
@@ -91,16 +105,7 @@ local function clearLine(y, bg)
 end
 
 local function addButton(id, x, y, w, label, fg, bg)
-    buttons[id] = {
-        x = x,
-        y = y,
-        w = w,
-        h = 1,
-        label = label,
-        fg = fg or colors.white,
-        bg = bg or colors.gray,
-    }
-
+    buttons[id] = { x = x, y = y, w = w, h = 1 }
     writeAt(x, y, trim(label, w), fg or colors.white, bg or colors.gray)
 end
 
@@ -113,15 +118,24 @@ local function buttonAt(x, y)
     return nil
 end
 
-local function visibleTrackArea()
+local function wake()
+    os.queueEvent("radio_wake")
+    os.queueEvent("radio_redraw")
+end
+
+local function trackListArea()
     local w, h = term.getSize()
-    return 7, h - 4
+    return 8, math.max(8, h - 12)
+end
+
+local function logArea()
+    local w, h = term.getSize()
+    return math.max(9, h - 10), h - 4
 end
 
 local function ensureCurrentVisible()
-    local top, bottom = visibleTrackArea()
+    local top, bottom = trackListArea()
     local rows = bottom - top + 1
-
     if rows < 1 then return end
 
     if state.current - 1 < state.scroll then
@@ -133,13 +147,15 @@ local function ensureCurrentVisible()
     state.scroll = clamp(state.scroll, 0, math.max(0, #tracks - rows))
 end
 
-local function wake()
-    os.queueEvent("radio_wake")
-    os.queueEvent("radio_redraw")
+local function getResponseCode(handle)
+    if handle and handle.getResponseCode then
+        local ok, code = pcall(function() return handle.getResponseCode() end)
+        if ok then return code end
+    end
+    return "?"
 end
 
-local function githubRequest(url)
-    -- GitHub sometimes behaves better with a User-Agent header.
+local function httpGetText(url)
     local headers = {
         ["User-Agent"] = "CC-Tweaked-JARVIS-Radio",
         ["Accept"] = "application/vnd.github+json",
@@ -148,70 +164,97 @@ local function githubRequest(url)
     return http.get(url, headers)
 end
 
-local function loadTracksFromRepo()
-    state.status = "Refreshing repo..."
-    state.errorText = nil
+local function httpGetBinary(url)
+    local headers = {
+        ["User-Agent"] = "CC-Tweaked-JARVIS-Radio",
+    }
+
+    return http.get(url, headers, true)
+end
+
+local function makeRawUrl(fileName)
+    local encoded = encodePath(fileName)
+
+    if state.useGithubRaw then
+        return RAW_BASE_GITHUB .. encoded
+    else
+        return RAW_BASE_RAWGITHUB .. encoded
+    end
+end
+
+local function addTrack(fileName, size)
+    table.insert(tracks, {
+        name = fileName,
+        display = niceName(fileName),
+        size = size or 0,
+        url = makeRawUrl(fileName),
+    })
+end
+
+local function loadTracksFromApi()
+    addLog("Contacting GitHub API...")
+    state.status = "Loading repo..."
+    state.lastError = ""
     wake()
 
-    local handle = githubRequest(API_URL)
+    local handle = httpGetText(API_URL)
     if not handle then
-        state.status = "Repo failed"
-        state.errorText = "Could not reach GitHub API. HTTP may be disabled or blocked."
+        state.status = "API failed"
+        state.lastError = "No response from GitHub API."
+        addLog("GitHub API failed.")
         wake()
         return false
     end
 
+    local code = getResponseCode(handle)
     local body = handle.readAll()
     handle.close()
 
+    addLog("GitHub API response: " .. tostring(code))
+
     local data = textutils.unserializeJSON(body)
     if type(data) ~= "table" then
-        state.status = "Bad repo data"
-        state.errorText = "GitHub did not return usable JSON."
+        state.status = "Bad API data"
+        state.lastError = "Could not parse GitHub JSON."
+        addLog("Could not parse GitHub JSON.")
         wake()
         return false
     end
 
-    local newTracks = {}
+    tracks = {}
 
     for _, item in ipairs(data) do
         if type(item) == "table" and item.type == "file" and type(item.name) == "string" then
-            local lower = item.name:lower()
-
-            if lower:match("%.dfpwm$") then
-                local rawUrl = RAW_BASE .. urlEncodePath(item.name)
-
-                table.insert(newTracks, {
-                    name = item.name,
-                    display = niceName(item.name),
-                    url = rawUrl,
-                    size = item.size or 0,
-                })
+            if item.name:lower():match("%.dfpwm$") then
+                addTrack(item.name, item.size or 0)
             end
         end
     end
 
-    table.sort(newTracks, function(a, b)
+    table.sort(tracks, function(a, b)
         return a.display:lower() < b.display:lower()
     end)
 
-    tracks = newTracks
-
     if #tracks == 0 then
-        state.current = 1
-        state.scroll = 0
         state.status = "No tracks"
-        state.errorText = "No .dfpwm files found in the repo root."
+        state.lastError = "No .dfpwm files found in repo root."
+        addLog("No .dfpwm tracks found.")
     else
         state.current = clamp(state.current, 1, #tracks)
-        state.scroll = clamp(state.scroll, 0, math.max(0, #tracks - 1))
+        ensureCurrentVisible()
         state.status = "Ready"
-        state.errorText = nil
+        state.lastError = ""
+        addLog("Loaded " .. #tracks .. " track(s).")
     end
 
-    ensureCurrentVisible()
     wake()
-    return true
+    return #tracks > 0
+end
+
+local function refreshTrackUrls()
+    for _, track in ipairs(tracks) do
+        track.url = makeRawUrl(track.name)
+    end
 end
 
 local function draw()
@@ -223,54 +266,74 @@ local function draw()
     term.clear()
 
     clearLine(1, colors.gray)
-    writeAt(2, 1, "JARVIS RADIO", colors.white, colors.gray)
-    writeAt(w - 14, 1, "GITHUB FM", colors.lightGray, colors.gray)
+    writeAt(2, 1, "JARVIS RADIO STREAMER", colors.white, colors.gray)
+    writeAt(math.max(2, w - 13), 1, "GITHUB FM", colors.lightGray, colors.gray)
 
     local currentTrack = tracks[state.current]
-    local title = currentTrack and currentTrack.display or "No tracks found"
+    local title = currentTrack and currentTrack.display or "No track selected"
 
     writeAt(2, 3, "Now Playing", colors.lightGray, colors.black)
     writeAt(2, 4, trim(title, w - 4), state.playing and colors.lime or colors.white, colors.black)
 
+    local mode = state.useGithubRaw and "github/raw" or "raw.githubusercontent"
     local info = "Status: " .. state.status ..
         " | Vol: " .. string.format("%.1f", state.volume) ..
-        " | Shuffle: " .. (state.shuffle and "ON" or "OFF") ..
-        " | Loop: " .. (state.loopTrack and "ON" or "OFF") ..
-        " | Tracks: " .. tostring(#tracks)
+        " | Tracks: " .. tostring(#tracks) ..
+        " | URL: " .. mode
 
     writeAt(2, 5, trim(info, w - 4), colors.lightGray, colors.black)
 
-    if state.errorText then
-        writeAt(2, 6, trim(state.errorText, w - 4), colors.red, colors.black)
+    if state.lastError and state.lastError ~= "" then
+        writeAt(2, 6, trim("Error: " .. state.lastError, w - 4), colors.red, colors.black)
     else
-        writeAt(2, 6, trim("Streaming from: " .. USER .. "/" .. REPO, w - 4), colors.gray, colors.black)
+        writeAt(2, 6, trim("Repo: " .. REPO_PAGE_URL, w - 4), colors.gray, colors.black)
     end
 
-    local listTop, listBottom = visibleTrackArea()
+    local listTop, listBottom = trackListArea()
+    for y = listTop, listBottom do clearLine(y, colors.black) end
+
     local rows = listBottom - listTop + 1
-
     for row = 1, rows do
-        local y = listTop + row - 1
-        clearLine(y, colors.black)
-
         local index = state.scroll + row
         local track = tracks[index]
+        local y = listTop + row - 1
 
         if track then
             local isCurrent = index == state.current
             local prefix = isCurrent and "> " or "  "
+            local sizeText = ""
+            if track.size and track.size > 0 then
+                sizeText = " [" .. math.floor(track.size / 1024) .. "KB]"
+            end
+
             local fg = isCurrent and colors.black or colors.white
             local bg = isCurrent and colors.lime or colors.black
-
-            writeAt(2, y, trim(prefix .. track.display, w - 4), fg, bg)
+            writeAt(2, y, trim(prefix .. track.display .. sizeText, w - 4), fg, bg)
         end
     end
 
+    local logTop, logBottom = logArea()
+    if logTop <= logBottom then
+        clearLine(logTop - 1, colors.gray)
+        writeAt(2, logTop - 1, "Log", colors.white, colors.gray)
+
+        for y = logTop, logBottom do clearLine(y, colors.black) end
+
+        local start = math.max(1, #logs - (logBottom - logTop))
+        local y = logTop
+        for i = start, #logs do
+            writeAt(2, y, trim(logs[i], w - 4), colors.lightGray, colors.black)
+            y = y + 1
+            if y > logBottom then break end
+        end
+    end
+
+    clearLine(h - 3, colors.gray)
     clearLine(h - 2, colors.gray)
     clearLine(h - 1, colors.gray)
     clearLine(h, colors.gray)
 
-    local y = h - 1
+    local y = h - 2
     local x = 2
 
     addButton("prev", x, y, 7, " Prev ", colors.white, colors.gray)
@@ -286,8 +349,8 @@ local function draw()
     addButton("next", x, y, 7, " Next ", colors.white, colors.gray)
     x = x + 8
 
-    addButton("shuffle", x, y, 10, state.shuffle and "Shuffle*" or "Shuffle ", colors.white, state.shuffle and colors.purple or colors.gray)
-    x = x + 11
+    addButton("shuffle", x, y, 9, state.shuffle and "Shuffle*" or "Shuffle ", colors.white, state.shuffle and colors.purple or colors.gray)
+    x = x + 10
 
     addButton("loop", x, y, 7, state.loopTrack and "Loop*" or "Loop ", colors.white, state.loopTrack and colors.blue or colors.gray)
     x = x + 8
@@ -298,11 +361,21 @@ local function draw()
     addButton("volup", x, y, 4, " + ", colors.white, colors.gray)
     x = x + 5
 
-    if x + 9 <= w then
-        addButton("refresh", x, y, 9, "Refresh", colors.white, colors.gray)
+    if x + 8 <= w then
+        addButton("refresh", x, y, 8, "Refresh", colors.white, colors.gray)
+        x = x + 9
     end
 
-    writeAt(2, h, "Click track to stream. Mouse wheel scrolls. Ctrl+T exits.", colors.lightGray, colors.gray)
+    if x + 8 <= w then
+        addButton("test", x, y, 8, " Test ", colors.white, colors.orange)
+        x = x + 9
+    end
+
+    if x + 8 <= w then
+        addButton("urlmode", x, y, 8, " URL ", colors.white, colors.brown)
+    end
+
+    writeAt(2, h, "Click a track, then Play. Test checks stream without playing full song.", colors.lightGray, colors.gray)
 end
 
 local function stopPlayback()
@@ -310,12 +383,15 @@ local function stopPlayback()
     state.status = "Stopped"
     state.token = state.token + 1
     speaker.stop()
+    addLog("Stopped.")
     wake()
 end
 
 local function playCurrent()
     if #tracks == 0 then
         state.status = "No tracks"
+        state.lastError = "No tracks loaded."
+        addLog("Play failed: no tracks.")
         wake()
         return
     end
@@ -323,11 +399,13 @@ local function playCurrent()
     state.current = clamp(state.current, 1, #tracks)
     ensureCurrentVisible()
 
+    local track = tracks[state.current]
     state.playing = true
     state.status = "Connecting..."
-    state.errorText = nil
+    state.lastError = ""
     state.token = state.token + 1
     speaker.stop()
+    addLog("Play requested: " .. track.display)
     wake()
 end
 
@@ -366,6 +444,8 @@ local function afterTrackFinished()
         return
     end
 
+    addLog("Track finished.")
+
     if state.loopTrack then
         playCurrent()
         return
@@ -387,12 +467,44 @@ local function afterTrackFinished()
     end
 end
 
-local function openStream(url)
-    -- Binary mode is important here. Without true as third arg,
-    -- some servers/versions can mangle binary-ish data.
-    return http.get(url, {
-        ["User-Agent"] = "CC-Tweaked-JARVIS-Radio",
-    }, true)
+local function testCurrentStream()
+    if #tracks == 0 then
+        state.lastError = "No track to test."
+        addLog("Test failed: no track.")
+        wake()
+        return
+    end
+
+    local track = tracks[state.current]
+    addLog("Testing URL...")
+    state.status = "Testing..."
+    state.lastError = ""
+    wake()
+
+    local handle = httpGetBinary(track.url)
+    if not handle then
+        state.status = "Test failed"
+        state.lastError = "Could not connect to stream URL."
+        addLog("Test failed: no HTTP handle.")
+        wake()
+        return
+    end
+
+    local code = getResponseCode(handle)
+    local chunk = handle.read(128)
+    handle.close()
+
+    if chunk and #chunk > 0 then
+        state.status = "Test OK"
+        state.lastError = ""
+        addLog("Test OK. HTTP " .. tostring(code) .. ", first chunk " .. tostring(#chunk) .. " bytes.")
+    else
+        state.status = "Test empty"
+        state.lastError = "Connected, but received no data."
+        addLog("Test empty. HTTP " .. tostring(code))
+    end
+
+    wake()
 end
 
 local function audioThread()
@@ -406,28 +518,35 @@ local function audioThread()
             if not track then
                 state.status = "Missing track"
                 state.playing = false
+                state.lastError = "Selected track is missing."
                 wake()
             else
                 state.status = "Connecting..."
-                state.errorText = nil
+                state.lastError = ""
+                addLog("Opening stream...")
                 wake()
 
-                local handle = openStream(track.url)
+                local handle = httpGetBinary(track.url)
 
                 if not handle then
                     if state.playing and token == state.token then
                         state.status = "Stream failed"
-                        state.errorText = "Could not open track URL."
+                        state.lastError = "Could not open stream URL."
                         state.playing = false
                         speaker.stop()
+                        addLog("Stream failed: no HTTP handle.")
                         wake()
                     end
                 else
-                    state.status = "Playing"
+                    local code = getResponseCode(handle)
+                    addLog("Stream opened. HTTP " .. tostring(code))
+                    state.status = "Buffering..."
                     wake()
 
                     local decoder = dfpwm.make_decoder()
                     local finishedNaturally = true
+                    local chunks = 0
+                    local bytes = 0
 
                     while true do
                         if not state.playing or token ~= state.token then
@@ -438,6 +557,15 @@ local function audioThread()
                         local chunk = handle.read(16 * 1024)
                         if not chunk then
                             break
+                        end
+
+                        chunks = chunks + 1
+                        bytes = bytes + #chunk
+
+                        if chunks == 1 then
+                            state.status = "Playing"
+                            addLog("First audio chunk: " .. tostring(#chunk) .. " bytes.")
+                            wake()
                         end
 
                         local buffer = decoder(chunk)
@@ -457,8 +585,16 @@ local function audioThread()
 
                     handle.close()
 
-                    if finishedNaturally and state.playing and token == state.token then
+                    if chunks == 0 then
+                        state.status = "No audio data"
+                        state.lastError = "Stream opened but returned zero chunks."
+                        state.playing = false
                         speaker.stop()
+                        addLog("No chunks received.")
+                        wake()
+                    elseif finishedNaturally and state.playing and token == state.token then
+                        speaker.stop()
+                        addLog("Received " .. tostring(math.floor(bytes / 1024)) .. "KB total.")
                         afterTrackFinished()
                     end
                 end
@@ -482,23 +618,27 @@ local function handleButton(id)
 
     elseif id == "shuffle" then
         state.shuffle = not state.shuffle
+        addLog("Shuffle " .. (state.shuffle and "ON" or "OFF"))
         wake()
 
     elseif id == "loop" then
         state.loopTrack = not state.loopTrack
+        addLog("Loop " .. (state.loopTrack and "ON" or "OFF"))
         wake()
 
     elseif id == "voldown" then
         state.volume = clamp(state.volume - 0.1, 0.0, 3.0)
+        addLog("Volume " .. string.format("%.1f", state.volume))
         wake()
 
     elseif id == "volup" then
         state.volume = clamp(state.volume + 0.1, 0.0, 3.0)
+        addLog("Volume " .. string.format("%.1f", state.volume))
         wake()
 
     elseif id == "refresh" then
         local oldName = tracks[state.current] and tracks[state.current].name
-        loadTracksFromRepo()
+        loadTracksFromApi()
 
         if oldName then
             for i, track in ipairs(tracks) do
@@ -510,6 +650,15 @@ local function handleButton(id)
         end
 
         ensureCurrentVisible()
+        wake()
+
+    elseif id == "test" then
+        testCurrentStream()
+
+    elseif id == "urlmode" then
+        state.useGithubRaw = not state.useGithubRaw
+        refreshTrackUrls()
+        addLog("URL mode changed.")
         wake()
     end
 end
@@ -525,7 +674,7 @@ local function uiThread()
 
         elseif event == "mouse_scroll" then
             local direction = a
-            local listTop, listBottom = visibleTrackArea()
+            local listTop, listBottom = trackListArea()
             local rows = listBottom - listTop + 1
 
             state.scroll = clamp(
@@ -544,15 +693,16 @@ local function uiThread()
                 handleButton(id)
                 draw()
             else
-                local listTop, listBottom = visibleTrackArea()
+                local listTop, listBottom = trackListArea()
 
                 if y >= listTop and y <= listBottom then
                     local index = state.scroll + (y - listTop + 1)
 
                     if tracks[index] then
                         state.current = index
-                        playCurrent()
-                        draw()
+                        ensureCurrentVisible()
+                        addLog("Selected: " .. tracks[index].display)
+                        wake()
                     end
                 end
             end
@@ -562,7 +712,8 @@ end
 
 math.randomseed(os.epoch("utc"))
 
-loadTracksFromRepo()
+addLog("Booting radio streamer...")
+loadTracksFromApi()
 
 parallel.waitForAny(audioThread, uiThread)
 
