@@ -1,15 +1,98 @@
--- JARVIS Radio GitHub Stream Player - Practical Build
+-- =============================================================================
+-- JARVIS RADIO GITHUB STREAM PLAYER
+-- MusicPlayer
+-- Self-updating GitHub streamer for CC:Tweaked. Volume changes apply live.
+--
+-- Normal run:
+--   MusicPlayer
+--
+-- Manual bypass updater:
+--   MusicPlayer --updated
+--
+-- Repo:
+--   https://github.com/JoshuaMEtaylor/MusicPlayerCC
+-- =============================================================================
+
+local args = {...}
+
+-- =============================================================================
+-- SAFE SELF UPDATE
+-- =============================================================================
+if args[1] ~= "--updated" then
+    print("[ JARVIS Radio ]")
+    print("Checking GitHub update...")
+
+    local program = shell.getRunningProgram and shell.getRunningProgram() or "MusicPlayer"
+    if not program or program == "" then program = "MusicPlayer" end
+
+    local tmp = program .. ".new"
+    local old = program .. ".old"
+
+    fs.delete(tmp)
+
+    local cb = tostring(os.epoch and os.epoch("utc") or math.floor(os.clock() * 100000))
+    local url = "https://raw.githubusercontent.com/JoshuaMEtaylor/MusicPlayerCC/refs/heads/main/MusicPlayer?cb=" .. cb
+
+    local okDownload = false
+    local body = nil
+
+    if http and http.get then
+        local handle = http.get(url, {
+            ["User-Agent"] = "CC-Tweaked-JARVIS-Radio-Updater",
+            ["Cache-Control"] = "no-cache",
+        })
+
+        if handle then
+            body = handle.readAll()
+            handle.close()
+        end
+    end
+
+    if body and #body > 1000 and not body:find("404: Not Found", 1, true) and not body:find("<!DOCTYPE html", 1, true) then
+        local f = fs.open(tmp, "w")
+        if f then
+            f.write(body)
+            f.close()
+            okDownload = true
+        end
+    end
+
+    if not okDownload then
+        fs.delete(tmp)
+        print("Update failed or invalid. Keeping current MusicPlayer.")
+        print("Starting local copy...")
+        sleep(0.75)
+    else
+        fs.delete(old)
+        if fs.exists(program) then fs.move(program, old) end
+        fs.move(tmp, program)
+
+        print("Updated. Relaunching...")
+        sleep(0.5)
+
+        local relaunch = { program, "--updated" }
+        for i = 1, #args do
+            relaunch[#relaunch + 1] = tostring(args[i])
+        end
+
+        local unpackFn = table.unpack or unpack
+        shell.run(unpackFn(relaunch))
+        return
+    end
+end
+
+
+-- JARVIS Radio GitHub Stream Player - Stop/Restart Fixed Build
 -- Save on GitHub as: MusicPlayer
 -- Update in ComputerCraft:
 --   delete MusicPlayer
 --   wget "https://raw.githubusercontent.com/JoshuaMEtaylor/MusicPlayerCC/main/MusicPlayer" MusicPlayer
 --   MusicPlayer
 --
--- What this version changes:
---   - Clicking a song starts playing immediately.
---   - Header says Selected Track instead of fake "Now Playing".
---   - Keyboard controls work even if buttons are cut off.
---   - Clear log messages show connection, chunks, and speaker playback.
+-- Fixes:
+--   - Stop now properly wakes playback if it is waiting for speaker buffer space.
+--   - Clicking/playing after Stop should restart the same track cleanly.
+--   - Better logs for stop/restart behaviour.
 --
 -- Controls:
 --   Click track = play immediately
@@ -190,6 +273,33 @@ local function wake()
     os.queueEvent("radio_redraw")
 end
 
+local function waitForSpeakerSpace(myToken)
+    -- Important:
+    -- Do NOT wait only for speaker_audio_empty. If Stop is pressed while the
+    -- player is waiting here, speaker.stop() may not fire that event. So we
+    -- also listen for radio_wake and use a small timer as a fallback.
+    while true do
+        if not state.playing or myToken ~= state.token then
+            return false
+        end
+
+        local timer = os.startTimer(0.25)
+        local event, p1 = os.pullEvent()
+
+        if event == "speaker_audio_empty" then
+            return true
+        elseif event == "radio_wake" then
+            if not state.playing or myToken ~= state.token then
+                return false
+            end
+        elseif event == "timer" and p1 == timer then
+            if not state.playing or myToken ~= state.token then
+                return false
+            end
+        end
+    end
+end
+
 local function loadTracksFromApi()
     addLog("Contacting GitHub API...")
     state.status = "Loading repo..."
@@ -367,6 +477,31 @@ local function stopPlayback()
     wake()
 end
 
+local function changeVolume(delta)
+    local old = state.volume
+    state.volume = clamp(state.volume + delta, 0.0, 3.0)
+
+    if math.abs(state.volume - old) < 0.0001 then
+        addLog("Volume already " .. string.format("%.1f", state.volume))
+        wake()
+        return
+    end
+
+    -- CC speaker volume is applied when a buffer is queued.
+    -- If music is already playing, old buffers may still be queued at the old
+    -- volume. Stop clears the speaker buffer, and the stream continues with
+    -- the next chunk at the new volume. This gives an immediate volume change.
+    if state.playing then
+        speaker.stop()
+        os.queueEvent("speaker_audio_empty")
+        addLog("Volume " .. string.format("%.1f", state.volume) .. " applied.")
+    else
+        addLog("Volume " .. string.format("%.1f", state.volume))
+    end
+
+    wake()
+end
+
 local function playCurrent()
     if #tracks == 0 then
         state.status = "No tracks"
@@ -533,11 +668,10 @@ local function audioThread()
                     local buffer = decoder(chunk)
 
                     while not speaker.playAudio(buffer, state.volume) do
-                        if not state.playing or token ~= state.token then
+                        if not waitForSpeakerSpace(token) then
                             finishedNaturally = false
                             break
                         end
-                        os.pullEvent("speaker_audio_empty")
                     end
 
                     if not finishedNaturally then break end
@@ -545,7 +679,7 @@ local function audioThread()
 
                 handle.close()
 
-                if chunks == 0 then
+                if chunks == 0 and state.playing and token == state.token then
                     state.status = "No audio data"
                     state.lastError = "Stream opened but returned zero chunks."
                     state.playing = false
@@ -556,6 +690,8 @@ local function audioThread()
                     speaker.stop()
                     addLog("Received " .. tostring(math.floor(bytes / 1024)) .. "KB total.")
                     afterTrackFinished()
+                else
+                    addLog("Playback thread released.")
                 end
             end
         end
@@ -579,13 +715,9 @@ local function handleButton(id)
         addLog("URL mode switched.")
         wake()
     elseif id == "voldown" then
-        state.volume = clamp(state.volume - 0.1, 0.0, 3.0)
-        addLog("Volume " .. string.format("%.1f", state.volume))
-        wake()
+        changeVolume(-0.1)
     elseif id == "volup" then
-        state.volume = clamp(state.volume + 0.1, 0.0, 3.0)
-        addLog("Volume " .. string.format("%.1f", state.volume))
-        wake()
+        changeVolume(0.1)
     end
 end
 
@@ -614,13 +746,9 @@ local function handleKey(key)
         addLog("URL mode switched.")
         wake()
     elseif key == keys.minus then
-        state.volume = clamp(state.volume - 0.1, 0.0, 3.0)
-        addLog("Volume " .. string.format("%.1f", state.volume))
-        wake()
+        changeVolume(-0.1)
     elseif key == keys.equals then
-        state.volume = clamp(state.volume + 0.1, 0.0, 3.0)
-        addLog("Volume " .. string.format("%.1f", state.volume))
-        wake()
+        changeVolume(0.1)
     end
 end
 
