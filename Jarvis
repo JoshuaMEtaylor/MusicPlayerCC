@@ -38,7 +38,7 @@
 --
 -- =============================================================================
 
-local VERSION = "1.5.1-wired-speaker-tts-debug"
+local VERSION = "1.5.2-tts-chunked-morning"
 local args = {...}
 
 -- =============================================================================
@@ -56,7 +56,8 @@ local MODEL = "gpt-4o-mini"
 
 local TTS_ENABLED = true
 local TTS_VOLUME = 1.0
-local TTS_MAX_CHARS = 900
+local TTS_SINGLE_REQUEST_MAX_CHARS = 220
+local TTS_TOTAL_MAX_CHARS = 2200
 local TTS_URL_BASE = "https://music.madefor.cc/tts?text="
 local TTS_CHUNK_SIZE = 16 * 1024
 local TTS_WAIT_TIMEOUT = 1.5
@@ -559,11 +560,61 @@ local function cleanSpeechText(text)
     text = text:gsub("%s+", " ")
     text = trim(text)
 
-    if #text > TTS_MAX_CHARS then
-        text = text:sub(1, TTS_MAX_CHARS) .. "..."
+    if #text > TTS_TOTAL_MAX_CHARS then
+        text = text:sub(1, TTS_TOTAL_MAX_CHARS) .. "..."
     end
 
     return text
+end
+
+local function splitSpeechChunks(text)
+    local cleaned = cleanSpeechText(text)
+    local chunks = {}
+
+    if cleaned == "" or cleaned == "nil" then
+        return chunks
+    end
+
+    while #cleaned > TTS_SINGLE_REQUEST_MAX_CHARS do
+        local head = cleaned:sub(1, TTS_SINGLE_REQUEST_MAX_CHARS)
+        local cut = nil
+
+        -- Prefer sentence boundaries.
+        for i = #head, 1, -1 do
+            local ch = head:sub(i, i)
+            if ch == "." or ch == "!" or ch == "?" or ch == ";" or ch == ":" then
+                cut = i
+                break
+            end
+        end
+
+        -- Fallback to the last space.
+        if not cut or cut < 80 then
+            for i = #head, 1, -1 do
+                if head:sub(i, i) == " " then
+                    cut = i
+                    break
+                end
+            end
+        end
+
+        if not cut or cut < 40 then
+            cut = TTS_SINGLE_REQUEST_MAX_CHARS
+        end
+
+        local chunk = trim(cleaned:sub(1, cut))
+        if chunk ~= "" then
+            chunks[#chunks + 1] = chunk
+        end
+
+        cleaned = trim(cleaned:sub(cut + 1))
+    end
+
+    if cleaned ~= "" then
+        chunks[#chunks + 1] = cleaned
+    end
+
+    return chunks
 end
 
 local function waitSpeakerEvent()
@@ -629,36 +680,9 @@ local function playAudioBufferOnAll(buffer, debug)
     end
 end
 
-local function speakToCity(text, debug)
-    if debug then print("[TTS] Requested.") end
-
-    if not TTS_ENABLED then
-        return false, "TTS disabled."
-    end
-
-    if not http or not http.get then
-        return false, "HTTP unavailable for TTS."
-    end
-
-    scanSpeakers()
-
+local function speakOneChunkToCity(cleaned, debug, chunkIndex, chunkCount)
     if debug then
-        print("[TTS] Speakers visible: " .. tostring(#citySpeakers))
-    end
-
-    if #citySpeakers == 0 then
-        return false, "No visible speaker peripherals."
-    end
-
-    local cleaned = cleanSpeechText(text)
-
-    if cleaned == "" or cleaned == "nil" then
-        return false, "Nothing to speak."
-    end
-
-    if debug then
-        print("[TTS] Text length: " .. tostring(#cleaned))
-        print("[TTS] Requesting TTS audio...")
+        print("[TTS] Requesting chunk " .. tostring(chunkIndex) .. "/" .. tostring(chunkCount) .. " (" .. tostring(#cleaned) .. " chars)...")
     end
 
     local ok, err = pcall(function()
@@ -693,7 +717,7 @@ local function speakToCity(text, debug)
             bytes = bytes + #chunk
 
             if debug and chunks == 1 then
-                print("[TTS] First chunk: " .. tostring(#chunk) .. " bytes.")
+                print("[TTS] First audio chunk: " .. tostring(#chunk) .. " bytes.")
             end
 
             local audio = decoder(chunk)
@@ -708,7 +732,7 @@ local function speakToCity(text, debug)
         response.close()
 
         if debug then
-            print("[TTS] Chunks: " .. tostring(chunks) .. " | Bytes: " .. tostring(bytes))
+            print("[TTS] Audio chunks: " .. tostring(chunks) .. " | Bytes: " .. tostring(bytes))
         end
 
         if chunks == 0 then
@@ -718,6 +742,54 @@ local function speakToCity(text, debug)
 
     if not ok then
         return false, tostring(err)
+    end
+
+    return true, "spoken"
+end
+
+local function speakToCity(text, debug)
+    if debug then print("[TTS] Requested.") end
+
+    if not TTS_ENABLED then
+        return false, "TTS disabled."
+    end
+
+    if not http or not http.get then
+        return false, "HTTP unavailable for TTS."
+    end
+
+    scanSpeakers()
+
+    if debug then
+        print("[TTS] Speakers visible: " .. tostring(#citySpeakers))
+    end
+
+    if #citySpeakers == 0 then
+        return false, "No visible speaker peripherals."
+    end
+
+    local chunks = splitSpeechChunks(text)
+
+    if #chunks == 0 then
+        return false, "Nothing to speak."
+    end
+
+    if debug then
+        local total = 0
+        for _, c in ipairs(chunks) do total = total + #c end
+        print("[TTS] Split into " .. tostring(#chunks) .. " request(s), " .. tostring(total) .. " chars total.")
+    end
+
+    for i, chunk in ipairs(chunks) do
+        local ok, err = speakOneChunkToCity(chunk, debug, i, #chunks)
+        if not ok then
+            return false, err
+        end
+
+        -- Small gap between separate TTS requests so the speaker buffer clears naturally.
+        if i < #chunks then
+            sleep(0.15)
+        end
     end
 
     return true, "spoken"
