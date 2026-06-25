@@ -1,69 +1,44 @@
 -- =============================================================================
 -- JARVIS TOWN BROADCAST CORE
--- Minimal ComputerCraft OpenAI chat client + GPT civic morning broadcast
+-- Wired Speaker Network + TTS Diagnostic Build
 --
--- Purpose:
---   JARVIS is being rebuilt as a town/state broadcasting intelligence.
---   This version stays mostly barebones, but adds the first broadcast behaviour:
---   once per Minecraft morning, generate a fresh city-wide loyalty/compliance
---   announcement for the Ako Dynasty and direct citizens toward daily music.
+-- Fix target:
+--   Wired speakers were found visually, but TTS was not being read aloud.
 --
--- Keeps:
---   - SAFE GITHUB SELF-UPDATER
---   - API key loading via require("JarvisKey")
---   - OpenAI request
---   - simple chat console loop
---   - once-per-Minecraft-day GPT-generated morning town broadcast
+-- This build:
+--   - scans wired speaker peripherals more aggressively
+--   - supports peripheral.hasType(name, "speaker")
+--   - prints TTS stage logs instead of failing silently
+--   - adds `tts debug`
+--   - adds `peripherals`
+--   - forces speaker rescan before TTS
+--   - reads JARVIS replies and morning broadcasts aloud over all visible speakers
 --
--- Removed:
---   - turtle/squad/fleet code
---   - GPS/network inboxes
---   - old databanks
---   - monitors
---   - TTS
---   - environment scanning
---   - local Lua execution tools
---
--- Nation identity:
---   Leader: Ako
---   Nation: the Ako Dynasty
---   Colours: red and black
---   Theme: East Asian dynastic/state-radio aesthetic
+-- Speaker setup:
+--   JARVIS computer + wired modem + networking cable + wired modem on each speaker.
 --
 -- Required file:
 --   JarvisKey.lua
 --
--- Supported JarvisKey.lua formats:
---
---   return "sk-..."
---
--- or:
---
---   return {
---     api_key = "sk-..."
---   }
---
--- or plain text:
---
---   sk-...
---
--- Normal run:
---   Jarvis
---
--- Manual bypass updater:
---   Jarvis --updated
---
 -- Commands:
---   exit      - close JARVIS
---   clear     - clear chat history
---   raw       - show latest raw response file
---   time      - show Minecraft date/time
---   morning   - force a fresh GPT morning town broadcast
---   music     - remind/start attention toward daily music
+--   exit
+--   clear
+--   raw
+--   time
+--   morning
+--   music
+--   speakers
+--   peripherals
+--   testspk
+--   stopspk
+--   tts on
+--   tts off
+--   tts test
+--   tts debug
 --
 -- =============================================================================
 
-local VERSION = "1.3.0-town-broadcast-ako"
+local VERSION = "1.5.1-wired-speaker-tts-debug"
 local args = {...}
 
 -- =============================================================================
@@ -73,19 +48,19 @@ local args = {...}
 local KEY_FILE = "JarvisKey.lua"
 local RAW_RESPONSE_FILE = "jarvis_latest_raw_response.txt"
 
--- SELF-UPDATER CONFIG
--- Put your actual raw GitHub JARVIS file here.
--- Example:
---   https://raw.githubusercontent.com/JoshuaMEtaylor/JarvisCC/refs/heads/main/Jarvis
---
--- This updater is ACTIVE. If the URL is wrong, it will safely keep the local copy.
 local UPDATE_ENABLED = true
 local UPDATE_URL = "https://raw.githubusercontent.com/JoshuaMEtaylor/JarvisCC/refs/heads/main/Jarvis"
 local UPDATE_SKIP_ARG = "--updated"
 
 local MODEL = "gpt-4o-mini"
 
--- Morning broadcast settings use Minecraft ingame clock.
+local TTS_ENABLED = true
+local TTS_VOLUME = 1.0
+local TTS_MAX_CHARS = 900
+local TTS_URL_BASE = "https://music.madefor.cc/tts?text="
+local TTS_CHUNK_SIZE = 16 * 1024
+local TTS_WAIT_TIMEOUT = 1.5
+
 local MORNING_ENABLED = true
 local MORNING_START_HOUR = 6
 local MORNING_END_HOUR = 9
@@ -94,12 +69,9 @@ local MORNING_STATE_FILE = "jarvis_morning_last_day.txt"
 local MORNING_HISTORY_FILE = "jarvis_morning_history.txt"
 local MORNING_HISTORY_MAX_CHARS = 3000
 
--- Music player integration is intentionally light for now.
--- The current MusicPlayer uses the same terminal, so JARVIS points attention to it.
 local MUSIC_PLAYER_PROGRAM = "MusicPlayer"
-local AUTO_OPEN_MUSIC_TAB = false -- only works if multishell exists
+local AUTO_OPEN_MUSIC_TAB = false
 
--- Fictional state identity.
 local NATION_NAME = "the Ako Dynasty"
 local LEADER_NAME = "Ako"
 local STATE_COLOURS = "red and black"
@@ -109,11 +81,11 @@ local SYSTEM_PROMPT = [[
 You are JARVIS, a concise Minecraft ComputerCraft assistant.
 
 You have been reset to base mode.
-You do not currently control turtles, squads, monitors, speakers, banking systems, economy systems, or external ComputerCraft devices.
-You are only a chat assistant running in a ComputerCraft terminal unless later integrations are added.
+You are now the voice of a fictional town broadcasting system for the Ako Dynasty.
+The broadcasts are played throughout the city to maintain civic order, compliance, morale, productivity, and continued loyalty.
 
-Your current purpose is to become the voice of a fictional town broadcasting system.
-The broadcasts are played throughout the city to maintain civic order, compliance, morale, productivity, and continued loyalty to the Ako Dynasty.
+JARVIS can use any speaker peripheral directly visible to this ComputerCraft computer through the wired speaker network.
+JARVIS replies and broadcasts are read aloud over TTS when TTS is enabled.
 
 Fictional state identity:
 - Nation: the Ako Dynasty.
@@ -126,8 +98,7 @@ Style rules:
 - Keep it in-world and theatrical.
 - Do not reference real-world regimes, countries, ethnic groups, political parties, real leaders, or real propaganda movements.
 - Do not mention China, North Korea, communism, fascism, or any real government.
-- Do not claim you control speakers, music, monitors, economy, or town systems unless that integration is actually added later.
-- You may talk about future public broadcast duties as a role, not as already-working hardware.
+- Do not claim you control systems that have not actually been integrated yet.
 
 Keep normal chat replies useful, direct, and conversational.
 ]]
@@ -141,11 +112,16 @@ local function s(v)
     return tostring(v)
 end
 
+local function trim(str)
+    str = tostring(str or "")
+    str = str:gsub("^%s+", "")
+    str = str:gsub("%s+$", "")
+    return str
+end
+
 local function hasArg(wanted)
     for _, arg in ipairs(args) do
-        if tostring(arg) == wanted then
-            return true
-        end
+        if tostring(arg) == wanted then return true end
     end
     return false
 end
@@ -167,13 +143,6 @@ local function writeFile(path, text)
     return true
 end
 
-local function trim(str)
-    str = tostring(str or "")
-    str = str:gsub("^%s+", "")
-    str = str:gsub("%s+$", "")
-    return str
-end
-
 local function line()
     print(string.rep("-", 40))
 end
@@ -185,14 +154,16 @@ local function limitText(text, maxChars)
     return text:sub(#text - maxChars + 1)
 end
 
+local function boolText(v)
+    return v and "yes" or "no"
+end
+
 -- =============================================================================
 -- SAFE SELF UPDATE
 -- =============================================================================
 
 local function selfUpdate()
-    if not UPDATE_ENABLED then
-        return
-    end
+    if not UPDATE_ENABLED then return end
 
     if hasArg(UPDATE_SKIP_ARG) then
         print("Auto-update skipped for freshly relaunched copy.")
@@ -222,7 +193,6 @@ local function selfUpdate()
 
     local tmp = program .. ".new"
     local old = program .. ".old"
-
     fs.delete(tmp)
 
     local cb = tostring(os.epoch and os.epoch("utc") or math.floor(os.clock() * 100000))
@@ -235,8 +205,7 @@ local function selfUpdate()
     })
 
     if not handle then
-        print("Update failed: no HTTP response.")
-        print("Keeping existing local copy.")
+        print("Update failed: no HTTP response. Keeping local copy.")
         sleep(0.5)
         return
     end
@@ -253,16 +222,14 @@ local function selfUpdate()
 
     if not okDownload then
         fs.delete(tmp)
-        print("Update rejected: empty, invalid, or not raw Lua.")
-        print("Keeping existing local copy.")
+        print("Update rejected: empty, invalid, or not raw Lua. Keeping local copy.")
         sleep(0.5)
         return
     end
 
     local f = fs.open(tmp, "w")
     if not f then
-        print("Could not write temporary update file.")
-        print("Keeping existing local copy.")
+        print("Could not write temporary update file. Keeping local copy.")
         return
     end
 
@@ -270,10 +237,7 @@ local function selfUpdate()
     f.close()
 
     fs.delete(old)
-    if fs.exists(program) then
-        fs.move(program, old)
-    end
-
+    if fs.exists(program) then fs.move(program, old) end
     fs.move(tmp, program)
 
     print("Updated. Relaunching...")
@@ -292,16 +256,13 @@ local function selfUpdate()
 end
 
 local updateResult = selfUpdate()
-if updateResult == "updated" then
-    return
-end
+if updateResult == "updated" then return end
 
 -- =============================================================================
 -- API KEY LOADING
 -- =============================================================================
 
 local function loadKey()
-    -- Preferred style: JarvisKey.lua returns a string or table.
     local ok, result = pcall(function()
         return require("JarvisKey")
     end)
@@ -312,33 +273,21 @@ local function loadKey()
         end
 
         if type(result) == "table" then
-            local key =
-                result.api_key or
-                result.key or
-                result.OPENAI_API_KEY or
-                result.openai_api_key
-
+            local key = result.api_key or result.key or result.OPENAI_API_KEY or result.openai_api_key
             if type(key) == "string" and trim(key) ~= "" then
                 return trim(key)
             end
         end
     end
 
-    -- Fallback: read as plain text.
     if not fs.exists(KEY_FILE) then
         error("Missing " .. KEY_FILE .. ". Add your OpenAI API key file first.")
     end
 
     local text = trim(readAll(KEY_FILE) or "")
-
     local quoted = text:match('return%s+["\'](.-)["\']')
-    if quoted and trim(quoted) ~= "" then
-        return trim(quoted)
-    end
-
-    if text ~= "" and not text:find("return", 1, true) then
-        return text
-    end
+    if quoted and trim(quoted) ~= "" then return trim(quoted) end
+    if text ~= "" and not text:find("return", 1, true) then return text end
 
     error("Could not load API key from " .. KEY_FILE)
 end
@@ -373,9 +322,7 @@ local function extractText(data)
             end
         end
 
-        if #parts > 0 then
-            return table.concat(parts, "\n")
-        end
+        if #parts > 0 then return table.concat(parts, "\n") end
     end
 
     return nil
@@ -386,11 +333,11 @@ local function callOpenAI(messages, overrideSystemPrompt)
         return nil, "HTTP API unavailable."
     end
 
-    local input = {}
-
-    input[#input + 1] = {
-        role = "system",
-        content = overrideSystemPrompt or SYSTEM_PROMPT
+    local input = {
+        {
+            role = "system",
+            content = overrideSystemPrompt or SYSTEM_PROMPT
+        }
     }
 
     for _, msg in ipairs(messages) do
@@ -411,9 +358,7 @@ local function callOpenAI(messages, overrideSystemPrompt)
         }
     )
 
-    if not response then
-        return nil, "No response from OpenAI."
-    end
+    if not response then return nil, "No response from OpenAI." end
 
     local raw = response.readAll()
     response.close()
@@ -427,9 +372,7 @@ local function callOpenAI(messages, overrideSystemPrompt)
 
     if data.error then
         local msg = "Unknown OpenAI error."
-        if type(data.error) == "table" and data.error.message then
-            msg = data.error.message
-        end
+        if type(data.error) == "table" and data.error.message then msg = data.error.message end
         return nil, "OpenAI error: " .. s(msg)
     end
 
@@ -442,11 +385,399 @@ local function callOpenAI(messages, overrideSystemPrompt)
 end
 
 -- =============================================================================
+-- WIRED SPEAKER PERIPHERAL DISCOVERY
+-- =============================================================================
+
+local citySpeakers = {}
+
+local function peripheralIsSpeaker(name)
+    if not name then return false end
+
+    if peripheral.hasType then
+        local ok, result = pcall(function()
+            return peripheral.hasType(name, "speaker")
+        end)
+        if ok and result == true then return true end
+    end
+
+    local pType = peripheral.getType(name)
+
+    if pType == "speaker" then return true end
+
+    if type(pType) == "table" then
+        for _, t in ipairs(pType) do
+            if t == "speaker" then return true end
+        end
+    end
+
+    return false
+end
+
+local function scanSpeakers()
+    citySpeakers = {}
+
+    for _, name in ipairs(peripheral.getNames()) do
+        if peripheralIsSpeaker(name) then
+            local wrapped = peripheral.wrap(name)
+
+            if wrapped and wrapped.playAudio then
+                citySpeakers[#citySpeakers + 1] = {
+                    name = name,
+                    speaker = wrapped,
+                    type = peripheral.getType(name),
+                }
+            end
+        end
+    end
+
+    table.sort(citySpeakers, function(a, b)
+        return tostring(a.name) < tostring(b.name)
+    end)
+
+    return #citySpeakers
+end
+
+local function speakerCount()
+    return #citySpeakers
+end
+
+local function printAllPeripherals()
+    print("")
+    line()
+    print("ALL VISIBLE PERIPHERALS")
+    print("")
+
+    local names = peripheral.getNames()
+    table.sort(names)
+
+    if #names == 0 then
+        print("No peripherals visible.")
+    end
+
+    for _, name in ipairs(names) do
+        local pType = peripheral.getType(name)
+        local hasSpeaker = peripheralIsSpeaker(name)
+        print(tostring(name) .. "  type=" .. textutils.serialize(pType) .. "  speaker=" .. boolText(hasSpeaker))
+    end
+
+    line()
+    print("")
+end
+
+local function printSpeakers()
+    print("")
+    line()
+    print("WIRED CITY SPEAKER NETWORK")
+    print("Detected speaker peripherals: " .. tostring(#citySpeakers))
+    print("TTS: " .. (TTS_ENABLED and "enabled" or "disabled"))
+    print("")
+
+    if #citySpeakers == 0 then
+        print("No speaker peripherals visible to JARVIS.")
+        print("")
+        print("Check the wired modem network:")
+        print("  - JARVIS computer has a wired modem connected to cable")
+        print("  - each speaker has a wired modem attached")
+        print("  - each modem is activated/connected")
+        print("  - all wired modems are connected by networking cable")
+        print("")
+        print("Use command: peripherals")
+    else
+        for i, item in ipairs(citySpeakers) do
+            print(tostring(i) .. ". " .. tostring(item.name) .. " type=" .. textutils.serialize(item.type))
+        end
+    end
+
+    line()
+    print("")
+end
+
+local function rescanSpeakers()
+    print("Scanning wired speaker network...")
+    local count = scanSpeakers()
+    print("Speaker scan complete: " .. tostring(count) .. " speaker(s) visible.")
+    printSpeakers()
+end
+
+local function playOnAllSpeakers(sound, volume, pitch)
+    if #citySpeakers == 0 then scanSpeakers() end
+
+    if #citySpeakers == 0 then
+        print("No visible speaker peripherals.")
+        return false, 0
+    end
+
+    local okCount = 0
+
+    for _, item in ipairs(citySpeakers) do
+        local ok, err = pcall(function()
+            item.speaker.playSound(sound, volume or 1, pitch or 1)
+        end)
+
+        if ok then
+            okCount = okCount + 1
+        else
+            print("Sound failed on " .. tostring(item.name) .. ": " .. tostring(err))
+        end
+    end
+
+    return okCount > 0, okCount
+end
+
+local function stopAllSpeakers()
+    if #citySpeakers == 0 then scanSpeakers() end
+
+    local count = 0
+
+    for _, item in ipairs(citySpeakers) do
+        local ok = pcall(function()
+            item.speaker.stop()
+        end)
+
+        if ok then count = count + 1 end
+    end
+
+    print("Stopped " .. tostring(count) .. " speaker(s).")
+end
+
+local function testSpeakers()
+    local ok, count = playOnAllSpeakers("minecraft:block.note_block.chime", 1, 1.2)
+
+    if ok then
+        print("Test sound played on " .. tostring(count) .. " speaker(s).")
+    end
+end
+
+-- =============================================================================
+-- TTS OVER WIRED SPEAKER NETWORK
+-- =============================================================================
+
+local function cleanSpeechText(text)
+    text = s(text)
+    text = text:gsub("[\r\n]+", ". ")
+    text = text:gsub("[%{%}%[%]\"_=<>|`#*]", " ")
+    text = text:gsub("%s+", " ")
+    text = trim(text)
+
+    if #text > TTS_MAX_CHARS then
+        text = text:sub(1, TTS_MAX_CHARS) .. "..."
+    end
+
+    return text
+end
+
+local function waitSpeakerEvent()
+    local timer = os.startTimer(TTS_WAIT_TIMEOUT)
+
+    while true do
+        local event, p1 = os.pullEvent()
+
+        if event == "speaker_audio_empty" then
+            return true
+        elseif event == "timer" and p1 == timer then
+            return false
+        end
+    end
+end
+
+local function playAudioBufferOnAll(buffer, debug)
+    scanSpeakers()
+
+    if #citySpeakers == 0 then
+        return false, "No visible speaker peripherals."
+    end
+
+    local pending = {}
+    for i = 1, #citySpeakers do pending[i] = true end
+
+    local attempts = 0
+
+    while true do
+        attempts = attempts + 1
+        local remaining = 0
+        local hadError = false
+
+        for i, item in ipairs(citySpeakers) do
+            if pending[i] then
+                local ok, accepted = pcall(function()
+                    return item.speaker.playAudio(buffer, TTS_VOLUME)
+                end)
+
+                if ok and accepted then
+                    pending[i] = false
+                else
+                    remaining = remaining + 1
+                    if not ok then
+                        hadError = true
+                        if debug then
+                            print("playAudio error on " .. tostring(item.name) .. ": " .. tostring(accepted))
+                        end
+                    end
+                end
+            end
+        end
+
+        if remaining == 0 then
+            return true
+        end
+
+        if hadError and attempts > 3 then
+            return false, "One or more speakers rejected audio buffers."
+        end
+
+        waitSpeakerEvent()
+    end
+end
+
+local function speakToCity(text, debug)
+    if debug then print("[TTS] Requested.") end
+
+    if not TTS_ENABLED then
+        return false, "TTS disabled."
+    end
+
+    if not http or not http.get then
+        return false, "HTTP unavailable for TTS."
+    end
+
+    scanSpeakers()
+
+    if debug then
+        print("[TTS] Speakers visible: " .. tostring(#citySpeakers))
+    end
+
+    if #citySpeakers == 0 then
+        return false, "No visible speaker peripherals."
+    end
+
+    local cleaned = cleanSpeechText(text)
+
+    if cleaned == "" or cleaned == "nil" then
+        return false, "Nothing to speak."
+    end
+
+    if debug then
+        print("[TTS] Text length: " .. tostring(#cleaned))
+        print("[TTS] Requesting TTS audio...")
+    end
+
+    local ok, err = pcall(function()
+        local dfpwm = require("cc.audio.dfpwm")
+        local decoder = dfpwm.make_decoder()
+
+        local url = TTS_URL_BASE .. textutils.urlEncode(cleaned)
+        local response = http.get(url, {
+            ["User-Agent"] = "CC-Tweaked-JARVIS-TTS",
+        }, true)
+
+        if not response then
+            error("TTS HTTP request failed.")
+        end
+
+        local code = "?"
+        if response.getResponseCode then
+            local okCode, c = pcall(function() return response.getResponseCode() end)
+            if okCode then code = tostring(c) end
+        end
+
+        if debug then print("[TTS] HTTP " .. tostring(code)) end
+
+        local chunks = 0
+        local bytes = 0
+
+        while true do
+            local chunk = response.read(TTS_CHUNK_SIZE)
+            if not chunk then break end
+
+            chunks = chunks + 1
+            bytes = bytes + #chunk
+
+            if debug and chunks == 1 then
+                print("[TTS] First chunk: " .. tostring(#chunk) .. " bytes.")
+            end
+
+            local audio = decoder(chunk)
+            local played, playErr = playAudioBufferOnAll(audio, debug)
+
+            if not played then
+                response.close()
+                error(playErr or "Speaker playback failed.")
+            end
+        end
+
+        response.close()
+
+        if debug then
+            print("[TTS] Chunks: " .. tostring(chunks) .. " | Bytes: " .. tostring(bytes))
+        end
+
+        if chunks == 0 then
+            error("TTS returned zero audio chunks.")
+        end
+    end)
+
+    if not ok then
+        return false, tostring(err)
+    end
+
+    return true, "spoken"
+end
+
+local function speakAsync(text)
+    local payload = tostring(text or "")
+
+    pcall(function()
+        parallel.waitForAny(
+            function()
+                local ok, err = speakToCity(payload, false)
+                if not ok then print("TTS warning: " .. tostring(err)) end
+            end,
+            function()
+                sleep(30)
+                print("TTS timeout.")
+            end
+        )
+    end)
+end
+
+local function ttsDebug()
+    print("")
+    line()
+    print("TTS DEBUG")
+    print("HTTP API: " .. boolText(http and http.get))
+    print("DFPWM require: testing...")
+    local okDfpwm, dfpwmOrErr = pcall(function() return require("cc.audio.dfpwm") end)
+    print("DFPWM OK: " .. boolText(okDfpwm))
+    if not okDfpwm then print("DFPWM error: " .. tostring(dfpwmOrErr)) end
+
+    scanSpeakers()
+    print("Speakers visible: " .. tostring(#citySpeakers))
+    for i, item in ipairs(citySpeakers) do
+        print(tostring(i) .. ". " .. tostring(item.name) .. " playAudio=" .. boolText(item.speaker and item.speaker.playAudio))
+    end
+
+    print("")
+    print("Playing chime...")
+    testSpeakers()
+    sleep(0.4)
+
+    print("")
+    print("Speaking test line...")
+    local okSpeak, speakErr = speakToCity("JARVIS town broadcast voice online. Red and black banners stand ready under Ako.", true)
+
+    if okSpeak then
+        print("TTS DEBUG RESULT: OK")
+    else
+        print("TTS DEBUG RESULT: FAILED")
+        print("Reason: " .. tostring(speakErr))
+    end
+
+    line()
+    print("")
+end
+
+-- =============================================================================
 -- MINECRAFT TIME ENGINE
--- Matched to the standalone MinecraftTimeTerminal style:
--- - Day 0 begins 00/00/0000
--- - Gregorian month lengths
--- - Minecraft ingame day/time from os.day("ingame") and os.time("ingame")
 -- =============================================================================
 
 local MONTH_NAMES = {
@@ -635,7 +966,7 @@ Generate one fresh morning city broadcast.
 
 Purpose:
 - This message is for a town broadcasting system.
-- It will be played throughout the city over public speakers.
+- It will be played throughout the city over public speakers using text-to-speech.
 - It exists to encourage civic order, compliance, morale, productivity, and continued loyalty.
 - It should direct citizens toward the daily patriotic/propaganda music programme near the end.
 
@@ -651,7 +982,7 @@ Style:
 - Use imagery of banners, dawn, order, duty, workshops, streets, bells, ledgers, furnaces, citizens, and dynasty where useful.
 - Make it sound like a dramatic public broadcast opening echoing through a city.
 - It should be unique and not reuse previous wording.
-- Keep it between 100 and 170 words.
+- Keep it between 100 and 150 words. TTS needs it concise.
 
 Restrictions:
 - Do not reference real-world country names, real-world political parties, real-world ethnic claims, real leaders, or real regimes.
@@ -668,6 +999,7 @@ Restrictions:
         "Minecraft time: " .. tostring(clock.time_text),
         "Absolute Minecraft day: " .. tostring(clock.absolute_day),
         "Forced test: " .. tostring(forced == true),
+        "Visible city speakers: " .. tostring(speakerCount()),
         "",
         "Avoid repeating these previous broadcasts:",
         history ~= "" and history or "No previous broadcasts recorded.",
@@ -703,8 +1035,14 @@ local function printMorningBroadcast(forced)
     print("Leader: " .. LEADER_NAME)
     print("Colours: " .. STATE_COLOURS)
     print("Purpose: city-wide compliance and loyalty broadcast")
+    print("Visible speakers: " .. tostring(speakerCount()))
+    print("TTS: " .. (TTS_ENABLED and "enabled" or "disabled"))
     print("Date: " .. c.date_text .. "  Time: " .. c.time_text)
     print("")
+
+    playOnAllSpeakers("minecraft:block.note_block.chime", 1, 1.0)
+    sleep(0.15)
+    playOnAllSpeakers("minecraft:block.note_block.chime", 1, 1.25)
 
     print("Composing fresh public broadcast...")
     local speech, err = generateMorningBroadcast(c, forced)
@@ -716,6 +1054,11 @@ local function printMorningBroadcast(forced)
     if err then
         print("NOTICE: " .. err)
         print("")
+    end
+
+    local okSpeak, speakErr = speakToCity(speech, true)
+    if not okSpeak then
+        print("TTS warning: " .. tostring(speakErr))
     end
 
     print(musicAttentionText())
@@ -743,9 +1086,7 @@ local function shouldRunMorningBroadcast()
     local c = minecraftClock()
     local last = lastMorningDay()
 
-    if last == c.absolute_day then
-        return false
-    end
+    if last == c.absolute_day then return false end
 
     if c.hour >= MORNING_START_HOUR and c.hour < MORNING_END_HOUR then
         return true, c
@@ -779,7 +1120,6 @@ local function addMessage(role, content)
         content = content
     }
 
-    -- Keep the base client light.
     while #chatHistory > 12 do
         table.remove(chatHistory, 1)
     end
@@ -793,7 +1133,7 @@ local function bootScreen()
     print("Version: " .. VERSION)
     print("Model: " .. MODEL)
     print("")
-    print("Mode: clean chat + GPT morning city broadcast")
+    print("Mode: clean chat + GPT morning city broadcast + TTS")
     print("Nation: " .. NATION_NAME)
     print("Leader: " .. LEADER_NAME)
     print("Colours: " .. STATE_COLOURS)
@@ -802,15 +1142,24 @@ local function bootScreen()
     print("Broadcast role:")
     print("  City-wide order, compliance, morale, and loyalty messaging")
     print("")
-    print("No turtles. No squads. No TTS. No monitors. No databanks.")
+    print("Wired speaker peripherals visible: " .. tostring(speakerCount()))
+    print("TTS: " .. (TTS_ENABLED and "enabled" or "disabled"))
     print("")
     print("Commands:")
-    print("  exit      - close JARVIS")
-    print("  clear     - clear chat history")
-    print("  raw       - show latest raw response file")
-    print("  time      - show Minecraft date/time")
-    print("  morning   - force fresh GPT city broadcast")
-    print("  music     - show daily music prompt")
+    print("  exit        - close JARVIS")
+    print("  clear       - clear chat history")
+    print("  raw         - show latest raw response file")
+    print("  time        - show Minecraft date/time")
+    print("  morning     - force fresh GPT city broadcast")
+    print("  music       - show daily music prompt")
+    print("  speakers    - rescan/list visible speakers")
+    print("  peripherals - list every visible peripheral")
+    print("  testspk     - play test chime on all speakers")
+    print("  stopspk     - stop all speakers")
+    print("  tts on      - enable TTS")
+    print("  tts off     - disable TTS")
+    print("  tts test    - speak test line")
+    print("  tts debug   - full TTS diagnostic")
     print("")
     line()
 end
@@ -827,10 +1176,10 @@ local function chatLoop()
             local lower = input:lower()
 
             if input == "" then
-                -- ignore empty input
 
             elseif lower == "exit" then
                 print("JARVIS offline.")
+                speakAsync("JARVIS offline.")
                 return
 
             elseif lower == "clear" then
@@ -842,7 +1191,9 @@ local function chatLoop()
 
             elseif lower == "time" then
                 local c = minecraftClock()
-                print("Minecraft date/time: " .. c.full_text .. " | Abs day " .. tostring(c.absolute_day))
+                local msg = "Minecraft date/time: " .. c.full_text .. " | Abs day " .. tostring(c.absolute_day)
+                print(msg)
+                speakAsync("Current city time is " .. c.time_text .. ".")
 
             elseif lower == "morning" then
                 printMorningBroadcast(true)
@@ -850,6 +1201,35 @@ local function chatLoop()
             elseif lower == "music" then
                 print(musicAttentionText())
                 print("Music command: " .. MUSIC_PLAYER_PROGRAM)
+                speakAsync("Citizens are directed to prepare the daily patriotic music programme.")
+
+            elseif lower == "speakers" then
+                rescanSpeakers()
+
+            elseif lower == "peripherals" then
+                printAllPeripherals()
+
+            elseif lower == "testspk" then
+                testSpeakers()
+
+            elseif lower == "stopspk" then
+                stopAllSpeakers()
+
+            elseif lower == "tts on" then
+                TTS_ENABLED = true
+                print("TTS enabled.")
+                speakAsync("Town broadcast voice enabled.")
+
+            elseif lower == "tts off" then
+                TTS_ENABLED = false
+                print("TTS disabled.")
+
+            elseif lower == "tts test" then
+                local okSpeak, speakErr = speakToCity("JARVIS town broadcast voice online. Red and black banners stand ready under Ako.", true)
+                if okSpeak then print("TTS test spoken.") else print("TTS test failed: " .. tostring(speakErr)) end
+
+            elseif lower == "tts debug" then
+                ttsDebug()
 
             else
                 addMessage("user", input)
@@ -860,12 +1240,14 @@ local function chatLoop()
 
                 if not reply then
                     print("ERROR: " .. s(err))
+                    speakAsync("OpenAI request failed.")
                 else
                     addMessage("assistant", reply)
                     print("")
                     print("JARVIS:")
                     print(reply)
                     print("")
+                    speakAsync(reply)
                 end
             end
         end
@@ -873,10 +1255,15 @@ local function chatLoop()
 end
 
 -- =============================================================================
--- MAIN
+-- STARTUP
 -- =============================================================================
 
 math.randomseed(os.epoch and os.epoch("utc") or math.floor(os.clock() * 100000))
+
+print("Scanning wired speaker network...")
+local foundSpeakers = scanSpeakers()
+print("Speaker scan complete: " .. tostring(foundSpeakers) .. " speaker(s) visible.")
+sleep(0.5)
 
 local ok, err = pcall(function()
     parallel.waitForAny(chatLoop, morningBroadcastLoop)
