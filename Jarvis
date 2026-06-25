@@ -1,5 +1,5 @@
 -- =============================================================================
--- JARVIS BASE CORE + MORNING STATE BROADCAST
+-- JARVIS BASE CORE + GPT MORNING STATE BROADCAST
 -- Minimal ComputerCraft OpenAI chat client
 --
 -- Keeps:
@@ -7,7 +7,13 @@
 --   - API key loading via require("JarvisKey")
 --   - OpenAI request
 --   - simple chat console loop
---   - once-per-Minecraft-day morning patriotic radio-style address
+--   - once-per-Minecraft-day GPT-generated morning patriotic radio address
+--
+-- Nation identity:
+--   Leader: Ako
+--   Nation: The Ako Dynasty
+--   Colours: Red and Black
+--   Theme: East Asian dynastic/state-radio aesthetic
 --
 -- Removed:
 --   - turtle/squad/fleet code
@@ -46,14 +52,14 @@
 --   clear     - clear chat history
 --   raw       - show latest raw response file
 --   time      - show Minecraft date/time
---   morning   - force a test morning broadcast
+--   morning   - force a fresh GPT morning address
 --   music     - remind/start attention toward daily music
 --
 -- IMPORTANT:
 --   Change UPDATE_URL below to your raw GitHub URL once your new JARVIS repo/path exists.
 -- =============================================================================
 
-local VERSION = "1.1.0-base-morning-state-radio"
+local VERSION = "1.2.0-gpt-morning-ako-dynasty"
 local args = {...}
 
 -- =============================================================================
@@ -76,11 +82,19 @@ local MORNING_START_HOUR = 6
 local MORNING_END_HOUR = 9
 local MORNING_CHECK_SECONDS = 10
 local MORNING_STATE_FILE = "jarvis_morning_last_day.txt"
+local MORNING_HISTORY_FILE = "jarvis_morning_history.txt"
+local MORNING_HISTORY_MAX_CHARS = 2500
 
 -- Music player integration is intentionally light.
 -- It will not auto-run by default because MusicPlayer uses the same terminal.
 local MUSIC_PLAYER_PROGRAM = "MusicPlayer"
 local AUTO_OPEN_MUSIC_TAB = false -- only works if multishell exists
+
+-- Fictional state identity.
+local NATION_NAME = "the Ako Dynasty"
+local LEADER_NAME = "Ako"
+local STATE_COLOURS = "red and black"
+local CULTURAL_THEME = "East Asian dynastic state-radio aesthetic"
 
 local SYSTEM_PROMPT = [[
 You are JARVIS, a concise Minecraft ComputerCraft assistant.
@@ -89,9 +103,14 @@ You have been reset to base mode.
 You do not currently control turtles, squads, monitors, speakers, banking systems, economy systems, or external ComputerCraft devices.
 You are only a chat assistant running in a ComputerCraft terminal.
 
-Your current added role is light state-radio personality:
-- You may speak in the style of a fictional patriotic state broadcaster.
-- Keep it in-world and theatrical.
+Your current added role is light state-radio personality for a fictional Minecraft nation:
+- Nation: the Ako Dynasty.
+- Leader: Ako.
+- Colours: red and black.
+- Theme: East Asian dynastic/state-radio aesthetic.
+- You may speak with ceremonial, patriotic, official-broadcast flair.
+- Do not reference real-world regimes, real-world governments, real ethnic groups, or real political parties.
+- Keep it fictional, in-world, theatrical, and useful.
 - Do not claim access to old JARVIS systems unless the user gives new code/data.
 - Do not claim you actually control music, speakers, towns, monitors, or the economy unless those integrations are later added.
 
@@ -133,6 +152,14 @@ local function writeFile(path, text)
     return true
 end
 
+local function appendFile(path, text)
+    local f = fs.open(path, "a")
+    if not f then return false end
+    f.write(text or "")
+    f.close()
+    return true
+end
+
 local function trim(str)
     str = tostring(str or "")
     str = str:gsub("^%s+", "")
@@ -144,9 +171,11 @@ local function line()
     print(string.rep("-", 40))
 end
 
-local function pick(list)
-    if type(list) ~= "table" or #list == 0 then return "" end
-    return list[math.random(1, #list)]
+local function limitText(text, maxChars)
+    text = tostring(text or "")
+    maxChars = tonumber(maxChars) or 1000
+    if #text <= maxChars then return text end
+    return text:sub(#text - maxChars + 1)
 end
 
 -- =============================================================================
@@ -289,6 +318,102 @@ end
 local API_KEY = loadKey()
 
 -- =============================================================================
+-- OPENAI CALL
+-- =============================================================================
+
+local function extractText(data)
+    if type(data) ~= "table" then return nil end
+
+    if type(data.output_text) == "string" then
+        return data.output_text
+    end
+
+    if type(data.output) == "table" then
+        local parts = {}
+
+        for _, item in ipairs(data.output) do
+            if type(item) == "table" and type(item.content) == "table" then
+                for _, content in ipairs(item.content) do
+                    if type(content) == "table" then
+                        if type(content.text) == "string" then
+                            parts[#parts + 1] = content.text
+                        elseif type(content.output_text) == "string" then
+                            parts[#parts + 1] = content.output_text
+                        end
+                    end
+                end
+            end
+        end
+
+        if #parts > 0 then
+            return table.concat(parts, "\n")
+        end
+    end
+
+    return nil
+end
+
+local function callOpenAI(messages, overrideSystemPrompt)
+    if not http or not http.post then
+        return nil, "HTTP API unavailable."
+    end
+
+    local input = {}
+
+    input[#input + 1] = {
+        role = "system",
+        content = overrideSystemPrompt or SYSTEM_PROMPT
+    }
+
+    for _, msg in ipairs(messages) do
+        input[#input + 1] = msg
+    end
+
+    local body = textutils.serializeJSON({
+        model = MODEL,
+        input = input
+    })
+
+    local response = http.post(
+        "https://api.openai.com/v1/responses",
+        body,
+        {
+            ["Content-Type"] = "application/json",
+            ["Authorization"] = "Bearer " .. API_KEY
+        }
+    )
+
+    if not response then
+        return nil, "No response from OpenAI."
+    end
+
+    local raw = response.readAll()
+    response.close()
+
+    writeFile(RAW_RESPONSE_FILE, raw)
+
+    local data = textutils.unserializeJSON(raw)
+    if not data then
+        return nil, "Could not parse OpenAI JSON. Raw response saved to " .. RAW_RESPONSE_FILE
+    end
+
+    if data.error then
+        local msg = "Unknown OpenAI error."
+        if type(data.error) == "table" and data.error.message then
+            msg = data.error.message
+        end
+        return nil, "OpenAI error: " .. s(msg)
+    end
+
+    local text = extractText(data)
+    if not text or text == "" then
+        return nil, "Could not extract response text. Raw response saved to " .. RAW_RESPONSE_FILE
+    end
+
+    return text, nil
+end
+
+-- =============================================================================
 -- MINECRAFT TIME ENGINE
 -- Matched to the standalone MinecraftTimeTerminal style:
 -- - Day 0 begins 00/00/0000
@@ -412,40 +537,8 @@ local function minecraftClock()
 end
 
 -- =============================================================================
--- MORNING STATE BROADCAST
+-- GPT MORNING STATE BROADCAST
 -- =============================================================================
-
-local OPENERS = {
-    "Citizens, rise with discipline. A new day begins beneath the steady light of the State.",
-    "Good morning, citizens. The capital wakes, the machines stir, and the nation advances as one.",
-    "People of the State, greet the morning with clear minds, full inventories, and loyal hearts.",
-    "This is JARVIS State Radio. Dawn has arrived, and with it another glorious opportunity to be useful.",
-    "Citizens of the nation, the day opens in strength. Let every furnace burn, every ledger balance, and every hand serve progress.",
-}
-
-local PRAISE_LINES = {
-    "Our common purpose is stronger than stone, sharper than steel, and more reliable than any private ambition.",
-    "The State endures because its citizens produce, cooperate, and move with one will.",
-    "Let no idle hour weaken the march of prosperity. Productivity is patriotism.",
-    "The nation does not ask for miracles. It asks for order, work, and loyalty.",
-    "Across the towns, workshops, farms, and offices, the people's labour becomes the future.",
-}
-
-local MUSIC_LINES = {
-    "Direct your attention now to the daily patriotic music programme. Let the anthem remind you that discipline is harmony.",
-    "The morning music selection will now prepare the spirit for labour, unity, and national confidence.",
-    "Citizens are encouraged to begin the daily propaganda music programme. Morale is a public resource.",
-    "Turn now to the approved morning music. A productive citizen keeps rhythm with the State.",
-    "The daily anthem awaits. Let the speakers carry resolve through every street and workshop.",
-}
-
-local CLOSERS = {
-    "Remain orderly. Remain productive. Remain worthy of the day.",
-    "Keep your tools ready, your accounts clean, and your loyalty visible.",
-    "This has been JARVIS. The day belongs to those who serve it.",
-    "Forward with purpose. The State is awake.",
-    "End of morning address. Work well, citizens.",
-}
 
 local function lastMorningDay()
     local text = trim(readAll(MORNING_STATE_FILE) or "")
@@ -454,6 +547,17 @@ end
 
 local function saveMorningDay(day)
     writeFile(MORNING_STATE_FILE, tostring(day))
+end
+
+local function readMorningHistory()
+    return limitText(readAll(MORNING_HISTORY_FILE) or "", MORNING_HISTORY_MAX_CHARS)
+end
+
+local function appendMorningHistory(day, text)
+    local entry = "\n\n--- DAY " .. tostring(day) .. " ---\n" .. tostring(text or "")
+    local existing = readAll(MORNING_HISTORY_FILE) or ""
+    local combined = limitText(existing .. entry, MORNING_HISTORY_MAX_CHARS)
+    writeFile(MORNING_HISTORY_FILE, combined)
 end
 
 local function musicAttentionText()
@@ -467,6 +571,7 @@ end
 local function tryOpenMusicTab()
     if not AUTO_OPEN_MUSIC_TAB then return false end
     if not fs.exists(MUSIC_PLAYER_PROGRAM) then return false end
+
     if multishell and multishell.launch then
         local id = multishell.launch({}, MUSIC_PLAYER_PROGRAM)
         if id then
@@ -474,7 +579,78 @@ local function tryOpenMusicTab()
             return true
         end
     end
+
     return false
+end
+
+local function fallbackMorningBroadcast(clock)
+    return table.concat({
+        "Good morning, citizens of the Ako Dynasty.",
+        "",
+        "Under the red and black banners of Ako, the new day rises with order, strength, and purpose. Let every workshop, field, ledger, and machine remember its place in the greater harmony of the Dynasty.",
+        "",
+        "The State calls for disciplined labour, clean accounts, and loyal hearts. Begin now with the approved daily patriotic music programme, and let its rhythm carry the will of Ako through every street.",
+        "",
+        "Remain productive. Remain orderly. The Dynasty advances."
+    }, "\n")
+end
+
+local function generateMorningBroadcast(clock, forced)
+    local history = readMorningHistory()
+
+    local morningSystem = [[
+You are JARVIS State Radio, the fictional official morning broadcaster of a Minecraft nation.
+
+Generate one fresh morning patriotic radio address.
+
+Identity:
+- Nation: the Ako Dynasty.
+- Leader: Ako.
+- Colours: red and black.
+- Theme: East Asian dynastic/state-radio aesthetic.
+
+Style:
+- Grand, ceremonial, confident, state-news-presenter tone.
+- Similar energy to an extremely loyal official broadcaster, but completely fictional.
+- Avoid real-world country names, real-world political parties, real-world ethnic claims, and real-world leaders.
+- Do not mention China, North Korea, communism, fascism, or any real regime.
+- Make it sound like a dramatic in-universe morning news/radio opening.
+- It should be unique and not reuse previous wording.
+- It should direct citizens toward the daily patriotic/propaganda music programme near the end.
+- Keep it between 90 and 150 words.
+- Return only the broadcast text. No markdown. No JSON.
+]]
+
+    local userPrompt = table.concat({
+        "Create today's morning address.",
+        "",
+        "Minecraft date: " .. tostring(clock.date_text),
+        "Minecraft time: " .. tostring(clock.time_text),
+        "Absolute Minecraft day: " .. tostring(clock.absolute_day),
+        "Forced test: " .. tostring(forced == true),
+        "",
+        "Avoid repeating these previous broadcasts:",
+        history ~= "" and history or "No previous broadcasts recorded.",
+    }, "\n")
+
+    local reply, err = callOpenAI({
+        {
+            role = "user",
+            content = userPrompt
+        }
+    }, morningSystem)
+
+    if not reply then
+        return fallbackMorningBroadcast(clock), "GPT morning generation failed: " .. tostring(err)
+    end
+
+    reply = trim(reply)
+
+    if reply == "" then
+        return fallbackMorningBroadcast(clock), "GPT morning generation returned empty text."
+    end
+
+    return reply, nil
 end
 
 local function printMorningBroadcast(forced)
@@ -483,21 +659,24 @@ local function printMorningBroadcast(forced)
     print("")
     line()
     print("JARVIS MORNING STATE BROADCAST")
+    print("Nation: " .. NATION_NAME)
+    print("Leader: " .. LEADER_NAME)
+    print("Colours: " .. STATE_COLOURS)
     print("Date: " .. c.date_text .. "  Time: " .. c.time_text)
     print("")
 
-    local speech = table.concat({
-        pick(OPENERS),
-        "",
-        pick(PRAISE_LINES),
-        "",
-        pick(MUSIC_LINES),
-        "",
-        pick(CLOSERS),
-    }, "\n")
+    print("Composing fresh broadcast...")
+    local speech, err = generateMorningBroadcast(c, forced)
 
+    print("")
     print(speech)
     print("")
+
+    if err then
+        print("NOTICE: " .. err)
+        print("")
+    end
+
     print(musicAttentionText())
 
     if tryOpenMusicTab() then
@@ -506,9 +685,11 @@ local function printMorningBroadcast(forced)
         print("Music command: " .. MUSIC_PLAYER_PROGRAM)
     end
 
-    if forced then
+    if not forced then
+        appendMorningHistory(c.absolute_day, speech)
+    else
         print("")
-        print("(Forced test broadcast. Daily trigger state was not changed.)")
+        print("(Forced test broadcast. Daily trigger state/history was not changed.)")
     end
 
     line()
@@ -546,102 +727,6 @@ local function morningBroadcastLoop()
 end
 
 -- =============================================================================
--- OPENAI CALL
--- =============================================================================
-
-local function extractText(data)
-    if type(data) ~= "table" then return nil end
-
-    if type(data.output_text) == "string" then
-        return data.output_text
-    end
-
-    if type(data.output) == "table" then
-        local parts = {}
-
-        for _, item in ipairs(data.output) do
-            if type(item) == "table" and type(item.content) == "table" then
-                for _, content in ipairs(item.content) do
-                    if type(content) == "table" then
-                        if type(content.text) == "string" then
-                            parts[#parts + 1] = content.text
-                        elseif type(content.output_text) == "string" then
-                            parts[#parts + 1] = content.output_text
-                        end
-                    end
-                end
-            end
-        end
-
-        if #parts > 0 then
-            return table.concat(parts, "\n")
-        end
-    end
-
-    return nil
-end
-
-local function callOpenAI(messages)
-    if not http or not http.post then
-        return nil, "HTTP API unavailable."
-    end
-
-    local input = {}
-
-    input[#input + 1] = {
-        role = "system",
-        content = SYSTEM_PROMPT
-    }
-
-    for _, msg in ipairs(messages) do
-        input[#input + 1] = msg
-    end
-
-    local body = textutils.serializeJSON({
-        model = MODEL,
-        input = input
-    })
-
-    local response = http.post(
-        "https://api.openai.com/v1/responses",
-        body,
-        {
-            ["Content-Type"] = "application/json",
-            ["Authorization"] = "Bearer " .. API_KEY
-        }
-    )
-
-    if not response then
-        return nil, "No response from OpenAI."
-    end
-
-    local raw = response.readAll()
-    response.close()
-
-    writeFile(RAW_RESPONSE_FILE, raw)
-
-    local data = textutils.unserializeJSON(raw)
-    if not data then
-        return nil, "Could not parse OpenAI JSON. Raw response saved to " .. RAW_RESPONSE_FILE
-    end
-
-    if data.error then
-        local msg = "Unknown OpenAI error."
-        if type(data.error) == "table" and data.error.message then
-            msg = data.error.message
-        end
-        return nil, "OpenAI error: " .. s(msg)
-    end
-
-    local text = extractText(data)
-    if not text or text == "" then
-        return nil, "Could not extract response text. Raw response saved to " .. RAW_RESPONSE_FILE
-    end
-
-    return text, nil
-end
-
--- =============================================================================
 -- CHAT LOOP
 -- =============================================================================
 
@@ -667,7 +752,12 @@ local function bootScreen()
     print("Version: " .. VERSION)
     print("Model: " .. MODEL)
     print("")
-    print("Mode: clean chat + morning state broadcast")
+    print("Mode: clean chat + GPT morning state broadcast")
+    print("Nation: " .. NATION_NAME)
+    print("Leader: " .. LEADER_NAME)
+    print("Colours: " .. STATE_COLOURS)
+    print("Theme: " .. CULTURAL_THEME)
+    print("")
     print("No turtles. No squads. No TTS. No monitors. No databanks.")
     print("")
     print("Commands:")
@@ -675,7 +765,7 @@ local function bootScreen()
     print("  clear     - clear chat history")
     print("  raw       - show latest raw response file")
     print("  time      - show Minecraft date/time")
-    print("  morning   - force test morning address")
+    print("  morning   - force fresh GPT morning address")
     print("  music     - show daily music prompt")
     print("")
     line()
