@@ -1,0 +1,437 @@
+-- =============================================================================
+-- JARVIS BASE CORE
+-- Minimal ComputerCraft OpenAI chat client
+--
+-- Keeps only:
+--   - safe GitHub self-updater
+--   - API key loading
+--   - OpenAI request
+--   - simple chat console loop
+--
+-- Removed:
+--   - turtle/squad/fleet code
+--   - GPS/network inboxes
+--   - databanks
+--   - monitors
+--   - TTS
+--   - environment scanning
+--   - local Lua execution tools
+--
+-- Required file:
+--   JarvisKey.lua
+--
+-- Supported JarvisKey.lua formats:
+--
+--   return "sk-..."
+--
+-- or:
+--
+--   return {
+--     api_key = "sk-..."
+--   }
+--
+-- or plain text:
+--
+--   sk-...
+--
+-- Normal run:
+--   Jarvis
+--
+-- Manual bypass updater:
+--   Jarvis --updated
+--
+-- IMPORTANT:
+--   Change UPDATE_URL below to your raw GitHub URL once your new JARVIS repo/path exists.
+-- =============================================================================
+
+local VERSION = "1.0.0-base-reset"
+local args = {...}
+
+-- =============================================================================
+-- CONFIG
+-- =============================================================================
+
+local KEY_FILE = "JarvisKey.lua"
+local RAW_RESPONSE_FILE = "jarvis_latest_raw_response.txt"
+
+-- CHANGE THIS when the new JARVIS GitHub file exists.
+local UPDATE_URL = "https://raw.githubusercontent.com/JoshuaMEtaylor/JarvisCC/refs/heads/main/Jarvis"
+
+local MODEL = "gpt-4o-mini"
+
+local SYSTEM_PROMPT = [[
+You are JARVIS, a concise Minecraft ComputerCraft assistant.
+
+You have been reset to base mode.
+You do not currently control turtles, squads, monitors, speakers, banking systems, economy systems, or external ComputerCraft devices.
+You are only a chat assistant running in a ComputerCraft terminal.
+
+Keep replies useful, direct, and conversational.
+Do not claim to have access to old files, old projects, old memory banks, turtle networks, or monitor systems unless the user explicitly gives you new code/data for them.
+]]
+
+-- =============================================================================
+-- SMALL UTILITIES
+-- =============================================================================
+
+local function s(v)
+    if v == nil then return "nil" end
+    return tostring(v)
+end
+
+local function hasArg(wanted)
+    for _, arg in ipairs(args) do
+        if tostring(arg) == wanted then
+            return true
+        end
+    end
+    return false
+end
+
+local function readAll(path)
+    if not fs.exists(path) then return nil end
+    local f = fs.open(path, "r")
+    if not f then return nil end
+    local text = f.readAll()
+    f.close()
+    return text
+end
+
+local function writeFile(path, text)
+    local f = fs.open(path, "w")
+    if not f then return false end
+    f.write(text or "")
+    f.close()
+    return true
+end
+
+local function trim(str)
+    str = tostring(str or "")
+    str = str:gsub("^%s+", "")
+    str = str:gsub("%s+$", "")
+    return str
+end
+
+local function line()
+    print(string.rep("-", 40))
+end
+
+-- =============================================================================
+-- SAFE SELF UPDATE
+-- =============================================================================
+
+local function selfUpdate()
+    if hasArg("--updated") then
+        return
+    end
+
+    if not http or not http.get then
+        print("HTTP unavailable. Skipping update.")
+        return
+    end
+
+    if not UPDATE_URL or UPDATE_URL == "" or UPDATE_URL:find("JarvisCC", 1, true) then
+        print("Updater URL still looks like the default placeholder.")
+        print("Set UPDATE_URL near the top of this file when your GitHub repo is ready.")
+        print("Skipping update.")
+        return
+    end
+
+    local program = shell and shell.getRunningProgram and shell.getRunningProgram() or "Jarvis"
+    if not program or program == "" then program = "Jarvis" end
+
+    print("[ JARVIS ]")
+    print("Checking GitHub update...")
+
+    local tmp = program .. ".new"
+    local old = program .. ".old"
+
+    fs.delete(tmp)
+
+    local cb = tostring(os.epoch and os.epoch("utc") or math.floor(os.clock() * 100000))
+    local url = UPDATE_URL .. "?cb=" .. cb
+
+    local handle = http.get(url, {
+        ["User-Agent"] = "CC-Tweaked-JARVIS-Base-Updater",
+        ["Cache-Control"] = "no-cache",
+    })
+
+    if not handle then
+        print("Update check failed. Starting local copy.")
+        sleep(0.5)
+        return
+    end
+
+    local body = handle.readAll()
+    handle.close()
+
+    local okDownload =
+        body and
+        #body > 1000 and
+        not body:find("404: Not Found", 1, true) and
+        not body:find("<!DOCTYPE html", 1, true)
+
+    if not okDownload then
+        print("Update rejected: empty, invalid, or not raw Lua.")
+        print("Starting local copy.")
+        sleep(0.5)
+        return
+    end
+
+    local f = fs.open(tmp, "w")
+    if not f then
+        print("Could not write update file. Starting local copy.")
+        return
+    end
+
+    f.write(body)
+    f.close()
+
+    fs.delete(old)
+    if fs.exists(program) then
+        fs.move(program, old)
+    end
+
+    fs.move(tmp, program)
+
+    print("Updated. Relaunching...")
+    sleep(0.5)
+
+    shell.run(program, "--updated")
+    return "updated"
+end
+
+local updateResult = selfUpdate()
+if updateResult == "updated" then
+    return
+end
+
+-- =============================================================================
+-- API KEY LOADING
+-- =============================================================================
+
+local function loadKey()
+    -- Preferred style: JarvisKey.lua returns a string or table.
+    local ok, result = pcall(function()
+        return require("JarvisKey")
+    end)
+
+    if ok then
+        if type(result) == "string" and trim(result) ~= "" then
+            return trim(result)
+        end
+
+        if type(result) == "table" then
+            local key =
+                result.api_key or
+                result.key or
+                result.OPENAI_API_KEY or
+                result.openai_api_key
+
+            if type(key) == "string" and trim(key) ~= "" then
+                return trim(key)
+            end
+        end
+    end
+
+    -- Fallback: read as plain text.
+    if not fs.exists(KEY_FILE) then
+        error("Missing " .. KEY_FILE .. ". Add your OpenAI API key file first.")
+    end
+
+    local text = trim(readAll(KEY_FILE) or "")
+
+    local quoted = text:match('return%s+["\'](.-)["\']')
+    if quoted and trim(quoted) ~= "" then
+        return trim(quoted)
+    end
+
+    if text ~= "" and not text:find("return", 1, true) then
+        return text
+    end
+
+    error("Could not load API key from " .. KEY_FILE)
+end
+
+local API_KEY = loadKey()
+
+-- =============================================================================
+-- OPENAI CALL
+-- =============================================================================
+
+local function extractText(data)
+    if type(data) ~= "table" then return nil end
+
+    if type(data.output_text) == "string" then
+        return data.output_text
+    end
+
+    if type(data.output) == "table" then
+        local parts = {}
+
+        for _, item in ipairs(data.output) do
+            if type(item) == "table" and type(item.content) == "table" then
+                for _, content in ipairs(item.content) do
+                    if type(content) == "table" then
+                        if type(content.text) == "string" then
+                            parts[#parts + 1] = content.text
+                        elseif type(content.output_text) == "string" then
+                            parts[#parts + 1] = content.output_text
+                        end
+                    end
+                end
+            end
+        end
+
+        if #parts > 0 then
+            return table.concat(parts, "\n")
+        end
+    end
+
+    return nil
+end
+
+local function callOpenAI(messages)
+    if not http or not http.post then
+        return nil, "HTTP API unavailable."
+    end
+
+    local input = {}
+
+    input[#input + 1] = {
+        role = "system",
+        content = SYSTEM_PROMPT
+    }
+
+    for _, msg in ipairs(messages) do
+        input[#input + 1] = msg
+    end
+
+    local body = textutils.serializeJSON({
+        model = MODEL,
+        input = input
+    })
+
+    local response = http.post(
+        "https://api.openai.com/v1/responses",
+        body,
+        {
+            ["Content-Type"] = "application/json",
+            ["Authorization"] = "Bearer " .. API_KEY
+        }
+    )
+
+    if not response then
+        return nil, "No response from OpenAI."
+    end
+
+    local raw = response.readAll()
+    response.close()
+
+    writeFile(RAW_RESPONSE_FILE, raw)
+
+    local data = textutils.unserializeJSON(raw)
+    if not data then
+        return nil, "Could not parse OpenAI JSON. Raw response saved to " .. RAW_RESPONSE_FILE
+    end
+
+    if data.error then
+        local msg = "Unknown OpenAI error."
+        if type(data.error) == "table" and data.error.message then
+            msg = data.error.message
+        end
+        return nil, "OpenAI error: " .. s(msg)
+    end
+
+    local text = extractText(data)
+    if not text or text == "" then
+        return nil, "Could not extract response text. Raw response saved to " .. RAW_RESPONSE_FILE
+    end
+
+    return text, nil
+end
+
+-- =============================================================================
+-- CHAT LOOP
+-- =============================================================================
+
+local chatHistory = {}
+
+local function addMessage(role, content)
+    chatHistory[#chatHistory + 1] = {
+        role = role,
+        content = content
+    }
+
+    -- Keep the base client light.
+    while #chatHistory > 12 do
+        table.remove(chatHistory, 1)
+    end
+end
+
+local function bootScreen()
+    term.clear()
+    term.setCursorPos(1, 1)
+
+    print("JARVIS BASE CORE")
+    print("Version: " .. VERSION)
+    print("Model: " .. MODEL)
+    print("")
+    print("Mode: clean chat only")
+    print("No turtles. No squads. No TTS. No monitors. No databanks.")
+    print("")
+    print("Commands:")
+    print("  exit   - close JARVIS")
+    print("  clear  - clear chat history")
+    print("  raw    - show raw response file path")
+    print("")
+    line()
+end
+
+local function main()
+    bootScreen()
+
+    while true do
+        write("> ")
+        local input = read()
+
+        if input then
+            input = trim(input)
+
+            if input == "" then
+                -- ignore empty input
+            elseif input:lower() == "exit" then
+                print("JARVIS offline.")
+                return
+            elseif input:lower() == "clear" then
+                chatHistory = {}
+                print("Chat history cleared.")
+            elseif input:lower() == "raw" then
+                print("Latest raw response file: " .. RAW_RESPONSE_FILE)
+            else
+                addMessage("user", input)
+
+                print("Thinking...")
+
+                local reply, err = callOpenAI(chatHistory)
+
+                if not reply then
+                    print("ERROR: " .. s(err))
+                else
+                    addMessage("assistant", reply)
+                    print("")
+                    print("JARVIS:")
+                    print(reply)
+                    print("")
+                end
+            end
+        end
+    end
+end
+
+local ok, err = pcall(main)
+if not ok then
+    term.setTextColor(colors.red)
+    print("JARVIS error: " .. s(err))
+    term.setTextColor(colors.white)
+end
