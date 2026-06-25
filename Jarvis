@@ -35,10 +35,13 @@
 --   tts off
 --   tts test
 --   tts debug
+--   tracks
+--   playmusic
+--   stopmusic
 --
 -- =============================================================================
 
-local VERSION = "1.5.2-tts-chunked-morning"
+local VERSION = "1.6.0-integrated-random-music"
 local args = {...}
 
 -- =============================================================================
@@ -56,7 +59,7 @@ local MODEL = "gpt-4o-mini"
 
 local TTS_ENABLED = true
 local TTS_VOLUME = 1.0
-local TTS_SINGLE_REQUEST_MAX_CHARS = 220
+local TTS_SINGLE_REQUEST_MAX_CHARS = 160
 local TTS_TOTAL_MAX_CHARS = 2200
 local TTS_URL_BASE = "https://music.madefor.cc/tts?text="
 local TTS_CHUNK_SIZE = 16 * 1024
@@ -70,8 +73,19 @@ local MORNING_STATE_FILE = "jarvis_morning_last_day.txt"
 local MORNING_HISTORY_FILE = "jarvis_morning_history.txt"
 local MORNING_HISTORY_MAX_CHARS = 3000
 
-local MUSIC_PLAYER_PROGRAM = "MusicPlayer"
-local AUTO_OPEN_MUSIC_TAB = false
+-- Integrated music streaming. JARVIS now plays the daily music itself.
+local MUSIC_REPO_USER = "JoshuaMEtaylor"
+local MUSIC_REPO = "MusicPlayerCC"
+local MUSIC_BRANCH = "main"
+local MUSIC_API_URL = "https://api.github.com/repos/" .. MUSIC_REPO_USER .. "/" .. MUSIC_REPO .. "/contents?ref=" .. MUSIC_BRANCH
+local MUSIC_RAW_BASE_RAWGITHUB = "https://raw.githubusercontent.com/" .. MUSIC_REPO_USER .. "/" .. MUSIC_REPO .. "/" .. MUSIC_BRANCH .. "/"
+local MUSIC_RAW_BASE_GITHUB = "https://github.com/" .. MUSIC_REPO_USER .. "/" .. MUSIC_REPO .. "/raw/refs/heads/" .. MUSIC_BRANCH .. "/"
+local MUSIC_VOLUME = 1.0
+local MUSIC_CHUNK_SIZE = 16 * 1024
+local MUSIC_FALLBACK_TRACKS = {
+    "dominica - gotta let you go (speed up + bass boosted) - sycone (128k).dfpwm",
+}
+
 
 local NATION_NAME = "the Ako Dynasty"
 local LEADER_NAME = "Ako"
@@ -83,7 +97,7 @@ You are JARVIS, a concise Minecraft ComputerCraft assistant.
 
 You have been reset to base mode.
 You are now the voice of a fictional town broadcasting system for the Ako Dynasty.
-The broadcasts are played throughout the city to maintain civic order, compliance, morale, productivity, and continued loyalty.
+The broadcasts are played throughout the city to maintain civic order, compliance, morale, productivity, and continued loyalty. JARVIS also selects and streams the daily patriotic music directly through the wired speaker network.
 
 JARVIS can use any speaker peripheral directly visible to this ComputerCraft computer through the wired speaker network.
 JARVIS replies and broadcasts are read aloud over TTS when TTS is enabled.
@@ -631,13 +645,14 @@ local function waitSpeakerEvent()
     end
 end
 
-local function playAudioBufferOnAll(buffer, debug)
+local function playAudioBufferOnAll(buffer, debug, volumeOverride)
     scanSpeakers()
 
     if #citySpeakers == 0 then
         return false, "No visible speaker peripherals."
     end
 
+    local volume = tonumber(volumeOverride) or TTS_VOLUME
     local pending = {}
     for i = 1, #citySpeakers do pending[i] = true end
 
@@ -651,7 +666,7 @@ local function playAudioBufferOnAll(buffer, debug)
         for i, item in ipairs(citySpeakers) do
             if pending[i] then
                 local ok, accepted = pcall(function()
-                    return item.speaker.playAudio(buffer, TTS_VOLUME)
+                    return item.speaker.playAudio(buffer, volume)
                 end)
 
                 if ok and accepted then
@@ -849,6 +864,231 @@ local function ttsDebug()
 end
 
 -- =============================================================================
+-- INTEGRATED MUSIC STREAMING
+-- =============================================================================
+
+local musicTracks = {}
+local currentMusicStopToken = 0
+
+local function encodePath(path)
+    return tostring(path or ""):gsub("([^%w%-%._~/])", function(c)
+        return string.format("%%%02X", string.byte(c))
+    end)
+end
+
+local function niceTrackName(fileName)
+    local name = tostring(fileName or "")
+    name = name:gsub("%.dfpwm$", "")
+    name = name:gsub("%.DFPWM$", "")
+    name = name:gsub("%%20", " ")
+    name = name:gsub("%s+", " ")
+    return name
+end
+
+local function musicUrlRawGithub(fileName)
+    return MUSIC_RAW_BASE_RAWGITHUB .. encodePath(fileName)
+end
+
+local function musicUrlGithubRaw(fileName)
+    return MUSIC_RAW_BASE_GITHUB .. encodePath(fileName)
+end
+
+local function addFallbackTracks(out)
+    for _, fileName in ipairs(MUSIC_FALLBACK_TRACKS) do
+        out[#out + 1] = {
+            name = fileName,
+            display = niceTrackName(fileName),
+            url = musicUrlRawGithub(fileName),
+            alt_url = musicUrlGithubRaw(fileName),
+            source = "fallback",
+        }
+    end
+end
+
+local function loadMusicTracks(debug)
+    local found = {}
+
+    if debug then print("[MUSIC] Loading track list from GitHub...") end
+
+    if http and http.get then
+        local handle = http.get(MUSIC_API_URL, {
+            ["User-Agent"] = "CC-Tweaked-JARVIS-Music",
+            ["Accept"] = "application/vnd.github+json",
+        })
+
+        if handle then
+            local code = "?"
+            if handle.getResponseCode then
+                local okCode, c = pcall(function() return handle.getResponseCode() end)
+                if okCode then code = tostring(c) end
+            end
+
+            local body = handle.readAll()
+            handle.close()
+
+            if debug then print("[MUSIC] GitHub API HTTP " .. tostring(code)) end
+
+            local data = textutils.unserializeJSON(body)
+            if type(data) == "table" then
+                for _, item in ipairs(data) do
+                    if type(item) == "table" and item.type == "file" and type(item.name) == "string" then
+                        if item.name:lower():match("%.dfpwm$") then
+                            found[#found + 1] = {
+                                name = item.name,
+                                display = niceTrackName(item.name),
+                                url = musicUrlRawGithub(item.name),
+                                alt_url = musicUrlGithubRaw(item.name),
+                                size = tonumber(item.size) or 0,
+                                source = "github_api",
+                            }
+                        end
+                    end
+                end
+            elseif debug then
+                print("[MUSIC] Could not parse GitHub API JSON.")
+            end
+        elseif debug then
+            print("[MUSIC] GitHub API request failed.")
+        end
+    end
+
+    if #found == 0 then
+        if debug then print("[MUSIC] Using fallback track list.") end
+        addFallbackTracks(found)
+    end
+
+    table.sort(found, function(a, b) return tostring(a.display) < tostring(b.display) end)
+    musicTracks = found
+    return found
+end
+
+local function listMusicTracks()
+    local list = loadMusicTracks(true)
+    print("")
+    line()
+    print("JARVIS MUSIC TRACKS")
+    print("Tracks: " .. tostring(#list))
+    print("")
+
+    for i, track in ipairs(list) do
+        local sizeText = track.size and track.size > 0 and (" [" .. tostring(math.floor(track.size / 1024)) .. "KB]") or ""
+        print(tostring(i) .. ". " .. tostring(track.display) .. sizeText .. " (" .. tostring(track.source) .. ")")
+    end
+
+    line()
+    print("")
+end
+
+local function openMusicHttp(track, debug)
+    local urls = { track.url, track.alt_url }
+
+    for i, url in ipairs(urls) do
+        if url and url ~= "" then
+            if debug then print("[MUSIC] Opening URL mode " .. tostring(i) .. "...") end
+            local handle = http.get(url, {
+                ["User-Agent"] = "CC-Tweaked-JARVIS-Music",
+            }, true)
+
+            if handle then
+                local code = "?"
+                if handle.getResponseCode then
+                    local okCode, c = pcall(function() return handle.getResponseCode() end)
+                    if okCode then code = tostring(c) end
+                end
+
+                if debug then print("[MUSIC] Stream HTTP " .. tostring(code)) end
+                return handle, code
+            elseif debug then
+                print("[MUSIC] URL mode " .. tostring(i) .. " failed.")
+            end
+        end
+    end
+
+    return nil, "no HTTP handle"
+end
+
+local function playMusicTrack(track, debug)
+    if not track then return false, "No track selected." end
+    if not http or not http.get then return false, "HTTP unavailable for music." end
+
+    scanSpeakers()
+    if #citySpeakers == 0 then return false, "No visible speaker peripherals." end
+
+    local token = currentMusicStopToken
+
+    if debug then
+        print("[MUSIC] Selected: " .. tostring(track.display))
+        print("[MUSIC] Speakers visible: " .. tostring(#citySpeakers))
+    end
+
+    local handle, code = openMusicHttp(track, debug)
+    if not handle then
+        return false, "Could not open music stream: " .. tostring(code)
+    end
+
+    local ok, err = pcall(function()
+        local dfpwm = require("cc.audio.dfpwm")
+        local decoder = dfpwm.make_decoder()
+        local chunks = 0
+        local bytes = 0
+
+        while true do
+            if token ~= currentMusicStopToken then
+                if debug then print("[MUSIC] Stopped by user.") end
+                break
+            end
+
+            local chunk = handle.read(MUSIC_CHUNK_SIZE)
+            if not chunk then break end
+
+            chunks = chunks + 1
+            bytes = bytes + #chunk
+
+            if debug and chunks == 1 then
+                print("[MUSIC] First audio chunk: " .. tostring(#chunk) .. " bytes.")
+            end
+
+            local audio = decoder(chunk)
+            local played, playErr = playAudioBufferOnAll(audio, debug, MUSIC_VOLUME)
+            if not played then
+                error(playErr or "Speaker playback failed.")
+            end
+        end
+
+        if debug then
+            print("[MUSIC] Audio chunks: " .. tostring(chunks) .. " | Bytes: " .. tostring(bytes))
+        end
+
+        if chunks == 0 then
+            error("Music stream returned zero audio chunks.")
+        end
+    end)
+
+    handle.close()
+
+    if not ok then
+        return false, tostring(err)
+    end
+
+    return true, "played"
+end
+
+local function playRandomMusic(debug)
+    local list = loadMusicTracks(debug)
+    if #list == 0 then return false, "No .dfpwm tracks found." end
+
+    local track = list[math.random(1, #list)]
+    print("Daily music selection: " .. tostring(track.display))
+
+    return playMusicTrack(track, debug)
+end
+
+local function stopMusicAndSpeakers()
+    currentMusicStopToken = currentMusicStopToken + 1
+    stopAllSpeakers()
+end
+
+-- =============================================================================
 -- MINECRAFT TIME ENGINE
 -- =============================================================================
 
@@ -991,29 +1231,6 @@ local function appendMorningHistory(day, text)
     writeFile(MORNING_HISTORY_FILE, combined)
 end
 
-local function musicAttentionText()
-    if fs.exists(MUSIC_PLAYER_PROGRAM) then
-        return "Daily music player detected. Run `" .. MUSIC_PLAYER_PROGRAM .. "` when ready."
-    end
-
-    return "Daily music player not found on this computer yet. Expected program: `" .. MUSIC_PLAYER_PROGRAM .. "`."
-end
-
-local function tryOpenMusicTab()
-    if not AUTO_OPEN_MUSIC_TAB then return false end
-    if not fs.exists(MUSIC_PLAYER_PROGRAM) then return false end
-
-    if multishell and multishell.launch then
-        local id = multishell.launch({}, MUSIC_PLAYER_PROGRAM)
-        if id then
-            multishell.setTitle(id, "Daily Music")
-            return true
-        end
-    end
-
-    return false
-end
-
 local function fallbackMorningBroadcast(clock)
     return table.concat({
         "Good morning, citizens of the Ako Dynasty.",
@@ -1133,12 +1350,11 @@ local function printMorningBroadcast(forced)
         print("TTS warning: " .. tostring(speakErr))
     end
 
-    print(musicAttentionText())
-
-    if tryOpenMusicTab() then
-        print("Daily music programme opened in a new tab.")
-    else
-        print("Music command: " .. MUSIC_PLAYER_PROGRAM)
+    print("")
+    print("Selecting daily patriotic music through JARVIS...")
+    local okMusic, musicErr = playRandomMusic(true)
+    if not okMusic then
+        print("Music warning: " .. tostring(musicErr))
     end
 
     if not forced then
@@ -1205,7 +1421,7 @@ local function bootScreen()
     print("Version: " .. VERSION)
     print("Model: " .. MODEL)
     print("")
-    print("Mode: clean chat + GPT morning city broadcast + TTS")
+    print("Mode: chat + GPT city broadcast + TTS + integrated music")
     print("Nation: " .. NATION_NAME)
     print("Leader: " .. LEADER_NAME)
     print("Colours: " .. STATE_COLOURS)
@@ -1223,7 +1439,7 @@ local function bootScreen()
     print("  raw         - show latest raw response file")
     print("  time        - show Minecraft date/time")
     print("  morning     - force fresh GPT city broadcast")
-    print("  music       - show daily music prompt")
+    print("  music       - play random daily music through JARVIS")
     print("  speakers    - rescan/list visible speakers")
     print("  peripherals - list every visible peripheral")
     print("  testspk     - play test chime on all speakers")
@@ -1231,7 +1447,10 @@ local function bootScreen()
     print("  tts on      - enable TTS")
     print("  tts off     - disable TTS")
     print("  tts test    - speak test line")
-    print("  tts debug   - full TTS diagnostic")
+    print("  tts debug   - full TTS diagnostic
+  tracks      - list discovered .dfpwm music tracks
+  playmusic   - play random daily music
+  stopmusic   - stop music/speakers")
     print("")
     line()
 end
@@ -1270,10 +1489,17 @@ local function chatLoop()
             elseif lower == "morning" then
                 printMorningBroadcast(true)
 
-            elseif lower == "music" then
-                print(musicAttentionText())
-                print("Music command: " .. MUSIC_PLAYER_PROGRAM)
-                speakAsync("Citizens are directed to prepare the daily patriotic music programme.")
+            elseif lower == "music" or lower == "playmusic" then
+                local okMusic, musicErr = playRandomMusic(true)
+                if not okMusic then
+                    print("Music failed: " .. tostring(musicErr))
+                end
+
+            elseif lower == "tracks" then
+                listMusicTracks()
+
+            elseif lower == "stopmusic" then
+                stopMusicAndSpeakers()
 
             elseif lower == "speakers" then
                 rescanSpeakers()
