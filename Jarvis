@@ -1,17 +1,18 @@
 -- =============================================================================
--- JARVIS BASE CORE
+-- JARVIS BASE CORE + MORNING STATE BROADCAST
 -- Minimal ComputerCraft OpenAI chat client
 --
--- Keeps only:
+-- Keeps:
 --   - safe GitHub self-updater
---   - API key loading
+--   - API key loading via require("JarvisKey")
 --   - OpenAI request
 --   - simple chat console loop
+--   - once-per-Minecraft-day morning patriotic radio-style address
 --
 -- Removed:
 --   - turtle/squad/fleet code
 --   - GPS/network inboxes
---   - databanks
+--   - old databanks
 --   - monitors
 --   - TTS
 --   - environment scanning
@@ -40,11 +41,19 @@
 -- Manual bypass updater:
 --   Jarvis --updated
 --
+-- Commands:
+--   exit      - close JARVIS
+--   clear     - clear chat history
+--   raw       - show latest raw response file
+--   time      - show Minecraft date/time
+--   morning   - force a test morning broadcast
+--   music     - remind/start attention toward daily music
+--
 -- IMPORTANT:
 --   Change UPDATE_URL below to your raw GitHub URL once your new JARVIS repo/path exists.
 -- =============================================================================
 
-local VERSION = "1.0.0-base-reset"
+local VERSION = "1.1.0-base-morning-state-radio"
 local args = {...}
 
 -- =============================================================================
@@ -55,9 +64,23 @@ local KEY_FILE = "JarvisKey.lua"
 local RAW_RESPONSE_FILE = "jarvis_latest_raw_response.txt"
 
 -- CHANGE THIS when the new JARVIS GitHub file exists.
+-- Example:
+-- local UPDATE_URL = "https://raw.githubusercontent.com/JoshuaMEtaylor/JarvisCC/refs/heads/main/Jarvis"
 local UPDATE_URL = "https://raw.githubusercontent.com/JoshuaMEtaylor/JarvisCC/refs/heads/main/Jarvis"
 
 local MODEL = "gpt-4o-mini"
+
+-- Morning broadcast settings use Minecraft ingame clock.
+local MORNING_ENABLED = true
+local MORNING_START_HOUR = 6
+local MORNING_END_HOUR = 9
+local MORNING_CHECK_SECONDS = 10
+local MORNING_STATE_FILE = "jarvis_morning_last_day.txt"
+
+-- Music player integration is intentionally light.
+-- It will not auto-run by default because MusicPlayer uses the same terminal.
+local MUSIC_PLAYER_PROGRAM = "MusicPlayer"
+local AUTO_OPEN_MUSIC_TAB = false -- only works if multishell exists
 
 local SYSTEM_PROMPT = [[
 You are JARVIS, a concise Minecraft ComputerCraft assistant.
@@ -66,8 +89,13 @@ You have been reset to base mode.
 You do not currently control turtles, squads, monitors, speakers, banking systems, economy systems, or external ComputerCraft devices.
 You are only a chat assistant running in a ComputerCraft terminal.
 
+Your current added role is light state-radio personality:
+- You may speak in the style of a fictional patriotic state broadcaster.
+- Keep it in-world and theatrical.
+- Do not claim access to old JARVIS systems unless the user gives new code/data.
+- Do not claim you actually control music, speakers, towns, monitors, or the economy unless those integrations are later added.
+
 Keep replies useful, direct, and conversational.
-Do not claim to have access to old files, old projects, old memory banks, turtle networks, or monitor systems unless the user explicitly gives you new code/data for them.
 ]]
 
 -- =============================================================================
@@ -114,6 +142,11 @@ end
 
 local function line()
     print(string.rep("-", 40))
+end
+
+local function pick(list)
+    if type(list) ~= "table" or #list == 0 then return "" end
+    return list[math.random(1, #list)]
 end
 
 -- =============================================================================
@@ -256,6 +289,263 @@ end
 local API_KEY = loadKey()
 
 -- =============================================================================
+-- MINECRAFT TIME ENGINE
+-- Matched to the standalone MinecraftTimeTerminal style:
+-- - Day 0 begins 00/00/0000
+-- - Gregorian month lengths
+-- - Minecraft ingame day/time from os.day("ingame") and os.time("ingame")
+-- =============================================================================
+
+local MONTH_NAMES = {
+    "January", "February", "March", "April", "May", "June",
+    "July", "August", "September", "October", "November", "December"
+}
+
+local MINECRAFT_DAY_MS = 20 * 60 * 1000
+
+local function nowMs()
+    if os.epoch then return os.epoch("utc") end
+    return math.floor(os.time() * 1000)
+end
+
+local function isLeapYear(year)
+    year = math.floor(tonumber(year) or 0)
+    if year % 400 == 0 then return true end
+    if year % 100 == 0 then return false end
+    return year % 4 == 0
+end
+
+local function monthLength(month_zero, year)
+    local base = {31,28,31,30,31,30,31,31,30,31,30,31}
+    local idx = (math.floor(tonumber(month_zero) or 0) % 12) + 1
+    if idx == 2 and isLeapYear(year) then return 29 end
+    return base[idx]
+end
+
+local function currentMinecraftDay()
+    if os.day then
+        local ok, day = pcall(os.day, "ingame")
+        if ok and tonumber(day) then return math.floor(tonumber(day)) end
+        ok, day = pcall(os.day)
+        if ok and tonumber(day) then return math.floor(tonumber(day)) end
+    end
+    return math.floor(nowMs() / MINECRAFT_DAY_MS)
+end
+
+local function currentMinecraftTimeHours()
+    if os.time then
+        local ok, t = pcall(os.time, "ingame")
+        if ok and tonumber(t) then return tonumber(t) end
+        ok, t = pcall(os.time)
+        if ok and tonumber(t) then return tonumber(t) end
+    end
+    local dayMs = nowMs() % MINECRAFT_DAY_MS
+    return (dayMs / MINECRAFT_DAY_MS) * 24
+end
+
+local function calendarFromMinecraftDay(day)
+    day = math.floor(tonumber(day) or 0)
+    if day < 0 then day = 0 end
+
+    local year = 0
+    local remaining = day
+
+    while true do
+        local year_len = isLeapYear(year) and 366 or 365
+        if remaining < year_len then break end
+        remaining = remaining - year_len
+        year = year + 1
+    end
+
+    local dayOfYear = remaining
+    local month = 0
+
+    while true do
+        local len = monthLength(month, year)
+        if remaining < len then break end
+        remaining = remaining - len
+        month = month + 1
+    end
+
+    return {
+        absolute_day = day,
+        year = year,
+        month = month,
+        month_name = MONTH_NAMES[(month % 12) + 1],
+        day_of_month = remaining,
+        day_of_year = dayOfYear,
+        leap_year = isLeapYear(year),
+    }
+end
+
+local function minecraftClock()
+    local absolute_day = currentMinecraftDay()
+    local cal = calendarFromMinecraftDay(absolute_day)
+
+    local t = currentMinecraftTimeHours() % 24
+    local tick = math.floor(((t / 24) * 24000) + 0.5) % 24000
+    local total_seconds = math.floor((tick / 24000) * 86400)
+    local hour = math.floor(total_seconds / 3600) % 24
+    local minute = math.floor((total_seconds % 3600) / 60)
+    local second = total_seconds % 60
+
+    local date_text = string.format("%02d/%02d/%04d", cal.day_of_month, cal.month, cal.year)
+    local time_text = string.format("%02d:%02d:%02d", hour, minute, second)
+
+    return {
+        day = absolute_day,
+        absolute_day = absolute_day,
+        year = cal.year,
+        month = cal.month,
+        month_name = cal.month_name,
+        day_of_month = cal.day_of_month,
+        day_of_year = cal.day_of_year,
+        leap_year = cal.leap_year,
+        tick = tick,
+        hour = hour,
+        minute = minute,
+        second = second,
+        date_text = date_text,
+        time_text = time_text,
+        full_text = date_text .. " " .. time_text,
+    }
+end
+
+-- =============================================================================
+-- MORNING STATE BROADCAST
+-- =============================================================================
+
+local OPENERS = {
+    "Citizens, rise with discipline. A new day begins beneath the steady light of the State.",
+    "Good morning, citizens. The capital wakes, the machines stir, and the nation advances as one.",
+    "People of the State, greet the morning with clear minds, full inventories, and loyal hearts.",
+    "This is JARVIS State Radio. Dawn has arrived, and with it another glorious opportunity to be useful.",
+    "Citizens of the nation, the day opens in strength. Let every furnace burn, every ledger balance, and every hand serve progress.",
+}
+
+local PRAISE_LINES = {
+    "Our common purpose is stronger than stone, sharper than steel, and more reliable than any private ambition.",
+    "The State endures because its citizens produce, cooperate, and move with one will.",
+    "Let no idle hour weaken the march of prosperity. Productivity is patriotism.",
+    "The nation does not ask for miracles. It asks for order, work, and loyalty.",
+    "Across the towns, workshops, farms, and offices, the people's labour becomes the future.",
+}
+
+local MUSIC_LINES = {
+    "Direct your attention now to the daily patriotic music programme. Let the anthem remind you that discipline is harmony.",
+    "The morning music selection will now prepare the spirit for labour, unity, and national confidence.",
+    "Citizens are encouraged to begin the daily propaganda music programme. Morale is a public resource.",
+    "Turn now to the approved morning music. A productive citizen keeps rhythm with the State.",
+    "The daily anthem awaits. Let the speakers carry resolve through every street and workshop.",
+}
+
+local CLOSERS = {
+    "Remain orderly. Remain productive. Remain worthy of the day.",
+    "Keep your tools ready, your accounts clean, and your loyalty visible.",
+    "This has been JARVIS. The day belongs to those who serve it.",
+    "Forward with purpose. The State is awake.",
+    "End of morning address. Work well, citizens.",
+}
+
+local function lastMorningDay()
+    local text = trim(readAll(MORNING_STATE_FILE) or "")
+    return tonumber(text)
+end
+
+local function saveMorningDay(day)
+    writeFile(MORNING_STATE_FILE, tostring(day))
+end
+
+local function musicAttentionText()
+    if fs.exists(MUSIC_PLAYER_PROGRAM) then
+        return "Daily music player detected. Run `" .. MUSIC_PLAYER_PROGRAM .. "` when ready."
+    end
+
+    return "Daily music player not found on this computer yet. Expected program: `" .. MUSIC_PLAYER_PROGRAM .. "`."
+end
+
+local function tryOpenMusicTab()
+    if not AUTO_OPEN_MUSIC_TAB then return false end
+    if not fs.exists(MUSIC_PLAYER_PROGRAM) then return false end
+    if multishell and multishell.launch then
+        local id = multishell.launch({}, MUSIC_PLAYER_PROGRAM)
+        if id then
+            multishell.setTitle(id, "Daily Music")
+            return true
+        end
+    end
+    return false
+end
+
+local function printMorningBroadcast(forced)
+    local c = minecraftClock()
+
+    print("")
+    line()
+    print("JARVIS MORNING STATE BROADCAST")
+    print("Date: " .. c.date_text .. "  Time: " .. c.time_text)
+    print("")
+
+    local speech = table.concat({
+        pick(OPENERS),
+        "",
+        pick(PRAISE_LINES),
+        "",
+        pick(MUSIC_LINES),
+        "",
+        pick(CLOSERS),
+    }, "\n")
+
+    print(speech)
+    print("")
+    print(musicAttentionText())
+
+    if tryOpenMusicTab() then
+        print("Daily music programme opened in a new tab.")
+    else
+        print("Music command: " .. MUSIC_PLAYER_PROGRAM)
+    end
+
+    if forced then
+        print("")
+        print("(Forced test broadcast. Daily trigger state was not changed.)")
+    end
+
+    line()
+    print("")
+end
+
+local function shouldRunMorningBroadcast()
+    if not MORNING_ENABLED then return false end
+
+    local c = minecraftClock()
+    local last = lastMorningDay()
+
+    if last == c.absolute_day then
+        return false
+    end
+
+    if c.hour >= MORNING_START_HOUR and c.hour < MORNING_END_HOUR then
+        return true, c
+    end
+
+    return false
+end
+
+local function morningBroadcastLoop()
+    while true do
+        local ok, c = shouldRunMorningBroadcast()
+
+        if ok and c then
+            printMorningBroadcast(false)
+            saveMorningDay(c.absolute_day)
+        end
+
+        sleep(MORNING_CHECK_SECONDS)
+    end
+end
+
+-- =============================================================================
 -- OPENAI CALL
 -- =============================================================================
 
@@ -377,18 +667,21 @@ local function bootScreen()
     print("Version: " .. VERSION)
     print("Model: " .. MODEL)
     print("")
-    print("Mode: clean chat only")
+    print("Mode: clean chat + morning state broadcast")
     print("No turtles. No squads. No TTS. No monitors. No databanks.")
     print("")
     print("Commands:")
-    print("  exit   - close JARVIS")
-    print("  clear  - clear chat history")
-    print("  raw    - show raw response file path")
+    print("  exit      - close JARVIS")
+    print("  clear     - clear chat history")
+    print("  raw       - show latest raw response file")
+    print("  time      - show Minecraft date/time")
+    print("  morning   - force test morning address")
+    print("  music     - show daily music prompt")
     print("")
     line()
 end
 
-local function main()
+local function chatLoop()
     bootScreen()
 
     while true do
@@ -397,17 +690,33 @@ local function main()
 
         if input then
             input = trim(input)
+            local lower = input:lower()
 
             if input == "" then
                 -- ignore empty input
-            elseif input:lower() == "exit" then
+
+            elseif lower == "exit" then
                 print("JARVIS offline.")
                 return
-            elseif input:lower() == "clear" then
+
+            elseif lower == "clear" then
                 chatHistory = {}
                 print("Chat history cleared.")
-            elseif input:lower() == "raw" then
+
+            elseif lower == "raw" then
                 print("Latest raw response file: " .. RAW_RESPONSE_FILE)
+
+            elseif lower == "time" then
+                local c = minecraftClock()
+                print("Minecraft date/time: " .. c.full_text .. " | Abs day " .. tostring(c.absolute_day))
+
+            elseif lower == "morning" then
+                printMorningBroadcast(true)
+
+            elseif lower == "music" then
+                print(musicAttentionText())
+                print("Music command: " .. MUSIC_PLAYER_PROGRAM)
+
             else
                 addMessage("user", input)
 
@@ -429,7 +738,16 @@ local function main()
     end
 end
 
-local ok, err = pcall(main)
+-- =============================================================================
+-- MAIN
+-- =============================================================================
+
+math.randomseed(os.epoch and os.epoch("utc") or math.floor(os.clock() * 100000))
+
+local ok, err = pcall(function()
+    parallel.waitForAny(chatLoop, morningBroadcastLoop)
+end)
+
 if not ok then
     term.setTextColor(colors.red)
     print("JARVIS error: " .. s(err))
