@@ -1,29 +1,238 @@
 -- =============================================================================
--- JARVIS RADIO GITHUB STREAM PLAYER
--- MusicPlayer
--- Self-updating GitHub streamer for CC:Tweaked. Volume changes apply live.
+-- JARVIS TOWN BROADCAST CORE
+-- Wired Speaker Network Build
+--
+-- Purpose:
+--   JARVIS is being rebuilt as a town/state broadcasting intelligence.
+--   This version stays mostly barebones, but adds:
+--     - once per Minecraft morning GPT-generated city loyalty broadcast
+--     - startup scan for all speaker peripherals exposed through a wired modem network
+--
+-- Speaker setup:
+--   Use wired modems + networking cable.
+--   Attach wired modems to speakers.
+--   Attach the JARVIS computer to the same wired modem network.
+--
+--   JARVIS will scan peripheral.getNames() and wrap every peripheral whose type
+--   is "speaker". No extra speaker-node computers are required.
+--
+-- Keeps:
+--   - SAFE GITHUB SELF-UPDATER
+--   - API key loading via require("JarvisKey")
+--   - OpenAI request
+--   - simple chat console loop
+--   - once-per-Minecraft-day GPT-generated morning town broadcast
+--   - direct speaker peripheral discovery/control
+--
+-- Removed:
+--   - turtle/squad/fleet code
+--   - GPS/network inboxes
+--   - old databanks
+--   - monitors
+--   - TTS
+--   - environment scanning
+--   - local Lua execution tools
+--   - separate speaker node networking
+--
+-- Nation identity:
+--   Leader: Ako
+--   Nation: the Ako Dynasty
+--   Colours: red and black
+--   Theme: East Asian dynastic/state-radio aesthetic
+--
+-- Required file:
+--   JarvisKey.lua
+--
+-- Supported JarvisKey.lua formats:
+--
+--   return "sk-..."
+--
+-- or:
+--
+--   return {
+--     api_key = "sk-..."
+--   }
+--
+-- or plain text:
+--
+--   sk-...
 --
 -- Normal run:
---   MusicPlayer
+--   Jarvis
 --
 -- Manual bypass updater:
---   MusicPlayer --updated
+--   Jarvis --updated
 --
--- Repo:
---   https://github.com/JoshuaMEtaylor/MusicPlayerCC
+-- Commands:
+--   exit      - close JARVIS
+--   clear     - clear chat history
+--   raw       - show latest raw response file
+--   time      - show Minecraft date/time
+--   morning   - force a fresh GPT morning town broadcast
+--   music     - remind/start attention toward daily music
+--   speakers  - rescan/list all visible wired speaker peripherals
+--   testspk   - play a test sound on all visible speaker peripherals
+--   stopspk   - stop all visible speakers
+--
 -- =============================================================================
 
+local VERSION = "1.4.2-wired-speaker-network"
 local args = {...}
+
+-- =============================================================================
+-- CONFIG
+-- =============================================================================
+
+local KEY_FILE = "JarvisKey.lua"
+local RAW_RESPONSE_FILE = "jarvis_latest_raw_response.txt"
+
+-- SELF-UPDATER CONFIG
+-- Put your actual raw GitHub JARVIS file here.
+-- Example:
+--   https://raw.githubusercontent.com/JoshuaMEtaylor/JarvisCC/refs/heads/main/Jarvis
+--
+-- This updater is ACTIVE. If the URL is wrong, it will safely keep the local copy.
+local UPDATE_ENABLED = true
+local UPDATE_URL = "https://raw.githubusercontent.com/JoshuaMEtaylor/JarvisCC/refs/heads/main/Jarvis"
+local UPDATE_SKIP_ARG = "--updated"
+
+local MODEL = "gpt-4o-mini"
+
+-- Morning broadcast settings use Minecraft ingame clock.
+local MORNING_ENABLED = true
+local MORNING_START_HOUR = 6
+local MORNING_END_HOUR = 9
+local MORNING_CHECK_SECONDS = 10
+local MORNING_STATE_FILE = "jarvis_morning_last_day.txt"
+local MORNING_HISTORY_FILE = "jarvis_morning_history.txt"
+local MORNING_HISTORY_MAX_CHARS = 3000
+
+-- Music player integration is intentionally light for now.
+-- The current MusicPlayer uses the same terminal, so JARVIS points attention to it.
+local MUSIC_PLAYER_PROGRAM = "MusicPlayer"
+local AUTO_OPEN_MUSIC_TAB = false -- only works if multishell exists
+
+-- Fictional state identity.
+local NATION_NAME = "the Ako Dynasty"
+local LEADER_NAME = "Ako"
+local STATE_COLOURS = "red and black"
+local CULTURAL_THEME = "East Asian dynastic state-radio aesthetic"
+
+local SYSTEM_PROMPT = [[
+You are JARVIS, a concise Minecraft ComputerCraft assistant.
+
+You have been reset to base mode.
+You do not currently control turtles, squads, monitors, banking systems, economy systems, or external ComputerCraft devices.
+You are only a chat assistant running in a ComputerCraft terminal unless later integrations are added.
+
+Your current purpose is to become the voice of a fictional town broadcasting system.
+The broadcasts are played throughout the city to maintain civic order, compliance, morale, productivity, and continued loyalty to the Ako Dynasty.
+
+JARVIS can use any speaker peripheral directly visible to this ComputerCraft computer through the wired speaker network.
+
+Fictional state identity:
+- Nation: the Ako Dynasty.
+- Leader: Ako.
+- Colours: red and black.
+- Theme: East Asian dynastic/state-radio aesthetic.
+
+Style rules:
+- Speak like a dramatic, ceremonial, loyal state broadcaster inside a fictional Minecraft nation.
+- Keep it in-world and theatrical.
+- Do not reference real-world regimes, countries, ethnic groups, political parties, real leaders, or real propaganda movements.
+- Do not mention China, North Korea, communism, fascism, or any real government.
+- Do not claim you control systems that have not actually been integrated yet.
+
+Keep normal chat replies useful, direct, and conversational.
+]]
+
+-- =============================================================================
+-- SMALL UTILITIES
+-- =============================================================================
+
+local function s(v)
+    if v == nil then return "nil" end
+    return tostring(v)
+end
+
+local function hasArg(wanted)
+    for _, arg in ipairs(args) do
+        if tostring(arg) == wanted then
+            return true
+        end
+    end
+    return false
+end
+
+local function readAll(path)
+    if not fs.exists(path) then return nil end
+    local f = fs.open(path, "r")
+    if not f then return nil end
+    local text = f.readAll()
+    f.close()
+    return text
+end
+
+local function writeFile(path, text)
+    local f = fs.open(path, "w")
+    if not f then return false end
+    f.write(text or "")
+    f.close()
+    return true
+end
+
+local function trim(str)
+    str = tostring(str or "")
+    str = str:gsub("^%s+", "")
+    str = str:gsub("%s+$", "")
+    return str
+end
+
+local function line()
+    print(string.rep("-", 40))
+end
+
+local function limitText(text, maxChars)
+    text = tostring(text or "")
+    maxChars = tonumber(maxChars) or 1000
+    if #text <= maxChars then return text end
+    return text:sub(#text - maxChars + 1)
+end
 
 -- =============================================================================
 -- SAFE SELF UPDATE
 -- =============================================================================
-if args[1] ~= "--updated" then
-    print("[ JARVIS Radio ]")
-    print("Checking GitHub update...")
 
-    local program = shell.getRunningProgram and shell.getRunningProgram() or "MusicPlayer"
-    if not program or program == "" then program = "MusicPlayer" end
+local function selfUpdate()
+    if not UPDATE_ENABLED then
+        return
+    end
+
+    if hasArg(UPDATE_SKIP_ARG) then
+        print("Auto-update skipped for freshly relaunched copy.")
+        return
+    end
+
+    if not http or not http.get then
+        print("HTTP unavailable. Skipping update.")
+        return
+    end
+
+    if not shell or not shell.run then
+        print("Shell API unavailable. Skipping update.")
+        return
+    end
+
+    if not UPDATE_URL or UPDATE_URL == "" then
+        print("No UPDATE_URL set. Skipping update.")
+        return
+    end
+
+    local program = shell.getRunningProgram and shell.getRunningProgram() or "Jarvis"
+    if not program or program == "" then program = "Jarvis" end
+
+    print("[ JARVIS Town Broadcast Core ]")
+    print("Checking GitHub update...")
 
     local tmp = program .. ".new"
     local old = program .. ".old"
@@ -31,780 +240,809 @@ if args[1] ~= "--updated" then
     fs.delete(tmp)
 
     local cb = tostring(os.epoch and os.epoch("utc") or math.floor(os.clock() * 100000))
-    local url = "https://raw.githubusercontent.com/JoshuaMEtaylor/MusicPlayerCC/refs/heads/main/MusicPlayer?cb=" .. cb
+    local sep = UPDATE_URL:find("?", 1, true) and "&" or "?"
+    local url = UPDATE_URL .. sep .. "cb=" .. cb
 
-    local okDownload = false
-    local body = nil
+    local handle = http.get(url, {
+        ["User-Agent"] = "CC-Tweaked-JARVIS-Town-Broadcast-Updater",
+        ["Cache-Control"] = "no-cache",
+    })
 
-    if http and http.get then
-        local handle = http.get(url, {
-            ["User-Agent"] = "CC-Tweaked-JARVIS-Radio-Updater",
-            ["Cache-Control"] = "no-cache",
-        })
-
-        if handle then
-            body = handle.readAll()
-            handle.close()
-        end
-    end
-
-    if body and #body > 1000 and not body:find("404: Not Found", 1, true) and not body:find("<!DOCTYPE html", 1, true) then
-        local f = fs.open(tmp, "w")
-        if f then
-            f.write(body)
-            f.close()
-            okDownload = true
-        end
-    end
-
-    if not okDownload then
-        fs.delete(tmp)
-        print("Update failed or invalid. Keeping current MusicPlayer.")
-        print("Starting local copy...")
-        sleep(0.75)
-    else
-        fs.delete(old)
-        if fs.exists(program) then fs.move(program, old) end
-        fs.move(tmp, program)
-
-        print("Updated. Relaunching...")
+    if not handle then
+        print("Update failed: no HTTP response.")
+        print("Keeping existing local copy.")
         sleep(0.5)
-
-        local relaunch = { program, "--updated" }
-        for i = 1, #args do
-            relaunch[#relaunch + 1] = tostring(args[i])
-        end
-
-        local unpackFn = table.unpack or unpack
-        shell.run(unpackFn(relaunch))
         return
     end
-end
 
-
--- JARVIS Radio GitHub Stream Player - Stop/Restart Fixed Build
--- Save on GitHub as: MusicPlayer
--- Update in ComputerCraft:
---   delete MusicPlayer
---   wget "https://raw.githubusercontent.com/JoshuaMEtaylor/MusicPlayerCC/main/MusicPlayer" MusicPlayer
---   MusicPlayer
---
--- Fixes:
---   - Stop now properly wakes playback if it is waiting for speaker buffer space.
---   - Clicking/playing after Stop should restart the same track cleanly.
---   - Better logs for stop/restart behaviour.
---
--- Controls:
---   Click track = play immediately
---   Space = play/stop
---   N = next
---   B = previous
---   S = shuffle
---   L = loop
---   R = refresh repo
---   T = test selected stream
---   U = switch raw URL mode
---   - / + = volume down/up
---   Ctrl+T = terminate
-
-local USER = "JoshuaMEtaylor"
-local REPO = "MusicPlayerCC"
-local BRANCH = "main"
-
-local API_URL = "https://api.github.com/repos/" .. USER .. "/" .. REPO .. "/contents?ref=" .. BRANCH
-local RAW_BASE_GITHUB = "https://github.com/" .. USER .. "/" .. REPO .. "/raw/refs/heads/" .. BRANCH .. "/"
-local RAW_BASE_RAWGITHUB = "https://raw.githubusercontent.com/" .. USER .. "/" .. REPO .. "/" .. BRANCH .. "/"
-
-local speaker = peripheral.find("speaker")
-if not speaker then
-    error("No speaker attached. Put a speaker next to the computer.")
-end
-
-if not http then
-    error("HTTP API is not enabled on this server.")
-end
-
-local dfpwm = require("cc.audio.dfpwm")
-
-local state = {
-    running = true,
-    playing = false,
-    current = 1,
-    scroll = 0,
-    volume = 1.0,
-    shuffle = false,
-    loopTrack = false,
-    token = 0,
-    status = "Booting...",
-    lastError = "",
-    useGithubRaw = true,
-}
-
-local tracks = {}
-local buttons = {}
-local logs = {}
-
-local function addLog(msg)
-    msg = tostring(msg or "")
-    local stamp = textutils.formatTime(os.time(), true)
-    table.insert(logs, "[" .. stamp .. "] " .. msg)
-    while #logs > 8 do table.remove(logs, 1) end
-    os.queueEvent("radio_redraw")
-end
-
-local function clamp(n, min, max)
-    if n < min then return min end
-    if n > max then return max end
-    return n
-end
-
-local function encodePath(s)
-    return tostring(s):gsub("([^%w%-%._~/])", function(c)
-        return string.format("%%%02X", string.byte(c))
-    end)
-end
-
-local function niceName(fileName)
-    local name = tostring(fileName or "")
-    name = name:gsub("%.dfpwm$", ""):gsub("%.DFPWM$", "")
-    name = name:gsub("%%20", " ")
-    name = name:gsub("%s+", " ")
-    return name
-end
-
-local function trim(text, width)
-    text = tostring(text or "")
-    if width <= 0 then return "" end
-    if #text <= width then return text .. string.rep(" ", width - #text) end
-    if width <= 3 then return text:sub(1, width) end
-    return text:sub(1, width - 3) .. "..."
-end
-
-local function writeAt(x, y, text, fg, bg)
-    if fg then term.setTextColor(fg) end
-    if bg then term.setBackgroundColor(bg) end
-    term.setCursorPos(x, y)
-    write(text)
-end
-
-local function clearLine(y, bg)
-    local w = term.getSize()
-    term.setCursorPos(1, y)
-    term.setBackgroundColor(bg or colors.black)
-    write(string.rep(" ", w))
-end
-
-local function addButton(id, x, y, w, label, fg, bg)
-    buttons[id] = { x = x, y = y, w = w, h = 1 }
-    writeAt(x, y, trim(label, w), fg or colors.white, bg or colors.gray)
-end
-
-local function buttonAt(x, y)
-    for id, b in pairs(buttons) do
-        if x >= b.x and x < b.x + b.w and y >= b.y and y < b.y + b.h then
-            return id
-        end
-    end
-    return nil
-end
-
-local function getResponseCode(handle)
-    if handle and handle.getResponseCode then
-        local ok, code = pcall(function() return handle.getResponseCode() end)
-        if ok then return code end
-    end
-    return "?"
-end
-
-local function httpGetText(url)
-    return http.get(url, {
-        ["User-Agent"] = "CC-Tweaked-JARVIS-Radio",
-        ["Accept"] = "application/vnd.github+json",
-    })
-end
-
-local function httpGetBinary(url)
-    return http.get(url, {
-        ["User-Agent"] = "CC-Tweaked-JARVIS-Radio",
-    }, true)
-end
-
-local function makeRawUrl(fileName)
-    local encoded = encodePath(fileName)
-    if state.useGithubRaw then
-        return RAW_BASE_GITHUB .. encoded
-    else
-        return RAW_BASE_RAWGITHUB .. encoded
-    end
-end
-
-local function refreshTrackUrls()
-    for _, track in ipairs(tracks) do
-        track.url = makeRawUrl(track.name)
-    end
-end
-
-local function trackListArea()
-    local w, h = term.getSize()
-    return 8, math.max(8, h - 12)
-end
-
-local function logArea()
-    local w, h = term.getSize()
-    return math.max(9, h - 10), h - 4
-end
-
-local function ensureCurrentVisible()
-    local top, bottom = trackListArea()
-    local rows = bottom - top + 1
-    if rows < 1 then return end
-
-    if state.current - 1 < state.scroll then
-        state.scroll = state.current - 1
-    elseif state.current > state.scroll + rows then
-        state.scroll = state.current - rows
-    end
-
-    state.scroll = clamp(state.scroll, 0, math.max(0, #tracks - rows))
-end
-
-local function wake()
-    os.queueEvent("radio_wake")
-    os.queueEvent("radio_redraw")
-end
-
-local function waitForSpeakerSpace(myToken)
-    -- Important:
-    -- Do NOT wait only for speaker_audio_empty. If Stop is pressed while the
-    -- player is waiting here, speaker.stop() may not fire that event. So we
-    -- also listen for radio_wake and use a small timer as a fallback.
-    while true do
-        if not state.playing or myToken ~= state.token then
-            return false
-        end
-
-        local timer = os.startTimer(0.25)
-        local event, p1 = os.pullEvent()
-
-        if event == "speaker_audio_empty" then
-            return true
-        elseif event == "radio_wake" then
-            if not state.playing or myToken ~= state.token then
-                return false
-            end
-        elseif event == "timer" and p1 == timer then
-            if not state.playing or myToken ~= state.token then
-                return false
-            end
-        end
-    end
-end
-
-local function loadTracksFromApi()
-    addLog("Contacting GitHub API...")
-    state.status = "Loading repo..."
-    state.lastError = ""
-    wake()
-
-    local handle = httpGetText(API_URL)
-    if not handle then
-        state.status = "API failed"
-        state.lastError = "No response from GitHub API."
-        addLog("GitHub API failed.")
-        wake()
-        return false
-    end
-
-    local code = getResponseCode(handle)
     local body = handle.readAll()
     handle.close()
 
-    addLog("GitHub API response: " .. tostring(code))
+    local okDownload =
+        body and
+        #body > 1000 and
+        not body:find("404: Not Found", 1, true) and
+        not body:find("<!DOCTYPE html", 1, true) and
+        not body:find("<html", 1, true)
 
-    local data = textutils.unserializeJSON(body)
-    if type(data) ~= "table" then
-        state.status = "Bad API data"
-        state.lastError = "Could not parse GitHub JSON."
-        addLog("Could not parse GitHub JSON.")
-        wake()
+    if not okDownload then
+        fs.delete(tmp)
+        print("Update rejected: empty, invalid, or not raw Lua.")
+        print("Keeping existing local copy.")
+        sleep(0.5)
+        return
+    end
+
+    local f = fs.open(tmp, "w")
+    if not f then
+        print("Could not write temporary update file.")
+        print("Keeping existing local copy.")
+        return
+    end
+
+    f.write(body)
+    f.close()
+
+    fs.delete(old)
+    if fs.exists(program) then
+        fs.move(program, old)
+    end
+
+    fs.move(tmp, program)
+
+    print("Updated. Relaunching...")
+    sleep(0.5)
+
+    local relaunch = { program, UPDATE_SKIP_ARG }
+    for i = 1, #args do
+        if tostring(args[i]) ~= UPDATE_SKIP_ARG then
+            relaunch[#relaunch + 1] = tostring(args[i])
+        end
+    end
+
+    local unpackFn = table.unpack or unpack
+    shell.run(unpackFn(relaunch))
+    return "updated"
+end
+
+local updateResult = selfUpdate()
+if updateResult == "updated" then
+    return
+end
+
+-- =============================================================================
+-- API KEY LOADING
+-- =============================================================================
+
+local function loadKey()
+    -- Preferred style: JarvisKey.lua returns a string or table.
+    local ok, result = pcall(function()
+        return require("JarvisKey")
+    end)
+
+    if ok then
+        if type(result) == "string" and trim(result) ~= "" then
+            return trim(result)
+        end
+
+        if type(result) == "table" then
+            local key =
+                result.api_key or
+                result.key or
+                result.OPENAI_API_KEY or
+                result.openai_api_key
+
+            if type(key) == "string" and trim(key) ~= "" then
+                return trim(key)
+            end
+        end
+    end
+
+    -- Fallback: read as plain text.
+    if not fs.exists(KEY_FILE) then
+        error("Missing " .. KEY_FILE .. ". Add your OpenAI API key file first.")
+    end
+
+    local text = trim(readAll(KEY_FILE) or "")
+
+    local quoted = text:match('return%s+["\'](.-)["\']')
+    if quoted and trim(quoted) ~= "" then
+        return trim(quoted)
+    end
+
+    if text ~= "" and not text:find("return", 1, true) then
+        return text
+    end
+
+    error("Could not load API key from " .. KEY_FILE)
+end
+
+local API_KEY = loadKey()
+
+-- =============================================================================
+-- OPENAI CALL
+-- =============================================================================
+
+local function extractText(data)
+    if type(data) ~= "table" then return nil end
+
+    if type(data.output_text) == "string" then
+        return data.output_text
+    end
+
+    if type(data.output) == "table" then
+        local parts = {}
+
+        for _, item in ipairs(data.output) do
+            if type(item) == "table" and type(item.content) == "table" then
+                for _, content in ipairs(item.content) do
+                    if type(content) == "table" then
+                        if type(content.text) == "string" then
+                            parts[#parts + 1] = content.text
+                        elseif type(content.output_text) == "string" then
+                            parts[#parts + 1] = content.output_text
+                        end
+                    end
+                end
+            end
+        end
+
+        if #parts > 0 then
+            return table.concat(parts, "\n")
+        end
+    end
+
+    return nil
+end
+
+local function callOpenAI(messages, overrideSystemPrompt)
+    if not http or not http.post then
+        return nil, "HTTP API unavailable."
+    end
+
+    local input = {}
+
+    input[#input + 1] = {
+        role = "system",
+        content = overrideSystemPrompt or SYSTEM_PROMPT
+    }
+
+    for _, msg in ipairs(messages) do
+        input[#input + 1] = msg
+    end
+
+    local body = textutils.serializeJSON({
+        model = MODEL,
+        input = input
+    })
+
+    local response = http.post(
+        "https://api.openai.com/v1/responses",
+        body,
+        {
+            ["Content-Type"] = "application/json",
+            ["Authorization"] = "Bearer " .. API_KEY
+        }
+    )
+
+    if not response then
+        return nil, "No response from OpenAI."
+    end
+
+    local raw = response.readAll()
+    response.close()
+
+    writeFile(RAW_RESPONSE_FILE, raw)
+
+    local data = textutils.unserializeJSON(raw)
+    if not data then
+        return nil, "Could not parse OpenAI JSON. Raw response saved to " .. RAW_RESPONSE_FILE
+    end
+
+    if data.error then
+        local msg = "Unknown OpenAI error."
+        if type(data.error) == "table" and data.error.message then
+            msg = data.error.message
+        end
+        return nil, "OpenAI error: " .. s(msg)
+    end
+
+    local text = extractText(data)
+    if not text or text == "" then
+        return nil, "Could not extract response text. Raw response saved to " .. RAW_RESPONSE_FILE
+    end
+
+    return text, nil
+end
+
+-- =============================================================================
+-- WIRED SPEAKER PERIPHERAL DISCOVERY
+-- =============================================================================
+
+local citySpeakers = {}
+
+local function scanSpeakers()
+    citySpeakers = {}
+
+    for _, name in ipairs(peripheral.getNames()) do
+        local pType = peripheral.getType(name)
+
+        if pType == "speaker" then
+            local wrapped = peripheral.wrap(name)
+
+            if wrapped then
+                citySpeakers[#citySpeakers + 1] = {
+                    name = name,
+                    speaker = wrapped,
+                    type = pType,
+                }
+            end
+        end
+    end
+
+    table.sort(citySpeakers, function(a, b)
+        return tostring(a.name) < tostring(b.name)
+    end)
+
+    return #citySpeakers
+end
+
+local function speakerCount()
+    return #citySpeakers
+end
+
+local function printSpeakers()
+    print("")
+    line()
+    print("WIRED CITY SPEAKER NETWORK")
+    print("Detected speaker peripherals: " .. tostring(#citySpeakers))
+    print("")
+
+    if #citySpeakers == 0 then
+        print("No speaker peripherals visible to JARVIS.")
+        print("")
+        print("Check the wired modem network:")
+        print("  - JARVIS computer has a wired modem connected to the cable network")
+        print("  - each speaker has a wired modem attached")
+        print("  - all wired modems are connected by networking cable")
+        print("")
+        print("Run this in Lua to debug visible peripherals:")
+        print('for _,n in ipairs(peripheral.getNames()) do print(n, peripheral.getType(n)) end')
+    else
+        for i, item in ipairs(citySpeakers) do
+            print(tostring(i) .. ". " .. tostring(item.name) .. " [" .. tostring(item.type) .. "]")
+        end
+    end
+
+    line()
+    print("")
+end
+
+local function rescanSpeakers()
+    print("Scanning wired speaker network...")
+    local count = scanSpeakers()
+    print("Speaker scan complete: " .. tostring(count) .. " speaker(s) visible.")
+    printSpeakers()
+end
+
+local function playOnAllSpeakers(sound, volume, pitch)
+    if #citySpeakers == 0 then
+        scanSpeakers()
+    end
+
+    if #citySpeakers == 0 then
+        print("No visible speaker peripherals.")
+        return false, 0
+    end
+
+    local okCount = 0
+
+    for _, item in ipairs(citySpeakers) do
+        local ok = pcall(function()
+            item.speaker.playSound(sound, volume or 1, pitch or 1)
+        end)
+
+        if ok then okCount = okCount + 1 end
+    end
+
+    return okCount > 0, okCount
+end
+
+local function stopAllSpeakers()
+    if #citySpeakers == 0 then
+        scanSpeakers()
+    end
+
+    local count = 0
+
+    for _, item in ipairs(citySpeakers) do
+        local ok = pcall(function()
+            item.speaker.stop()
+        end)
+
+        if ok then count = count + 1 end
+    end
+
+    print("Stopped " .. tostring(count) .. " speaker(s).")
+end
+
+local function testSpeakers()
+    local ok, count = playOnAllSpeakers("minecraft:block.note_block.chime", 1, 1.2)
+
+    if ok then
+        print("Test sound played on " .. tostring(count) .. " speaker(s).")
+    end
+end
+
+-- =============================================================================
+-- MINECRAFT TIME ENGINE
+-- Matched to the standalone MinecraftTimeTerminal style:
+-- - Day 0 begins 00/00/0000
+-- - Gregorian month lengths
+-- - Minecraft ingame day/time from os.day("ingame") and os.time("ingame")
+-- =============================================================================
+
+local MONTH_NAMES = {
+    "January", "February", "March", "April", "May", "June",
+    "July", "August", "September", "October", "November", "December"
+}
+
+local MINECRAFT_DAY_MS = 20 * 60 * 1000
+
+local function nowMs()
+    if os.epoch then return os.epoch("utc") end
+    return math.floor(os.time() * 1000)
+end
+
+local function isLeapYear(year)
+    year = math.floor(tonumber(year) or 0)
+    if year % 400 == 0 then return true end
+    if year % 100 == 0 then return false end
+    return year % 4 == 0
+end
+
+local function monthLength(month_zero, year)
+    local base = {31,28,31,30,31,30,31,31,30,31,30,31}
+    local idx = (math.floor(tonumber(month_zero) or 0) % 12) + 1
+    if idx == 2 and isLeapYear(year) then return 29 end
+    return base[idx]
+end
+
+local function currentMinecraftDay()
+    if os.day then
+        local ok, day = pcall(os.day, "ingame")
+        if ok and tonumber(day) then return math.floor(tonumber(day)) end
+        ok, day = pcall(os.day)
+        if ok and tonumber(day) then return math.floor(tonumber(day)) end
+    end
+    return math.floor(nowMs() / MINECRAFT_DAY_MS)
+end
+
+local function currentMinecraftTimeHours()
+    if os.time then
+        local ok, t = pcall(os.time, "ingame")
+        if ok and tonumber(t) then return tonumber(t) end
+        ok, t = pcall(os.time)
+        if ok and tonumber(t) then return tonumber(t) end
+    end
+    local dayMs = nowMs() % MINECRAFT_DAY_MS
+    return (dayMs / MINECRAFT_DAY_MS) * 24
+end
+
+local function calendarFromMinecraftDay(day)
+    day = math.floor(tonumber(day) or 0)
+    if day < 0 then day = 0 end
+
+    local year = 0
+    local remaining = day
+
+    while true do
+        local year_len = isLeapYear(year) and 366 or 365
+        if remaining < year_len then break end
+        remaining = remaining - year_len
+        year = year + 1
+    end
+
+    local dayOfYear = remaining
+    local month = 0
+
+    while true do
+        local len = monthLength(month, year)
+        if remaining < len then break end
+        remaining = remaining - len
+        month = month + 1
+    end
+
+    return {
+        absolute_day = day,
+        year = year,
+        month = month,
+        month_name = MONTH_NAMES[(month % 12) + 1],
+        day_of_month = remaining,
+        day_of_year = dayOfYear,
+        leap_year = isLeapYear(year),
+    }
+end
+
+local function minecraftClock()
+    local absolute_day = currentMinecraftDay()
+    local cal = calendarFromMinecraftDay(absolute_day)
+
+    local t = currentMinecraftTimeHours() % 24
+    local tick = math.floor(((t / 24) * 24000) + 0.5) % 24000
+    local total_seconds = math.floor((tick / 24000) * 86400)
+    local hour = math.floor(total_seconds / 3600) % 24
+    local minute = math.floor((total_seconds % 3600) / 60)
+    local second = total_seconds % 60
+
+    local date_text = string.format("%02d/%02d/%04d", cal.day_of_month, cal.month, cal.year)
+    local time_text = string.format("%02d:%02d:%02d", hour, minute, second)
+
+    return {
+        day = absolute_day,
+        absolute_day = absolute_day,
+        year = cal.year,
+        month = cal.month,
+        month_name = cal.month_name,
+        day_of_month = cal.day_of_month,
+        day_of_year = cal.day_of_year,
+        leap_year = cal.leap_year,
+        tick = tick,
+        hour = hour,
+        minute = minute,
+        second = second,
+        date_text = date_text,
+        time_text = time_text,
+        full_text = date_text .. " " .. time_text,
+    }
+end
+
+-- =============================================================================
+-- GPT MORNING TOWN BROADCAST
+-- =============================================================================
+
+local function lastMorningDay()
+    local text = trim(readAll(MORNING_STATE_FILE) or "")
+    return tonumber(text)
+end
+
+local function saveMorningDay(day)
+    writeFile(MORNING_STATE_FILE, tostring(day))
+end
+
+local function readMorningHistory()
+    return limitText(readAll(MORNING_HISTORY_FILE) or "", MORNING_HISTORY_MAX_CHARS)
+end
+
+local function appendMorningHistory(day, text)
+    local entry = "\n\n--- DAY " .. tostring(day) .. " ---\n" .. tostring(text or "")
+    local existing = readAll(MORNING_HISTORY_FILE) or ""
+    local combined = limitText(existing .. entry, MORNING_HISTORY_MAX_CHARS)
+    writeFile(MORNING_HISTORY_FILE, combined)
+end
+
+local function musicAttentionText()
+    if fs.exists(MUSIC_PLAYER_PROGRAM) then
+        return "Daily music player detected. Run `" .. MUSIC_PLAYER_PROGRAM .. "` when ready."
+    end
+
+    return "Daily music player not found on this computer yet. Expected program: `" .. MUSIC_PLAYER_PROGRAM .. "`."
+end
+
+local function tryOpenMusicTab()
+    if not AUTO_OPEN_MUSIC_TAB then return false end
+    if not fs.exists(MUSIC_PLAYER_PROGRAM) then return false end
+
+    if multishell and multishell.launch then
+        local id = multishell.launch({}, MUSIC_PLAYER_PROGRAM)
+        if id then
+            multishell.setTitle(id, "Daily Music")
+            return true
+        end
+    end
+
+    return false
+end
+
+local function fallbackMorningBroadcast(clock)
+    return table.concat({
+        "Good morning, citizens of the Ako Dynasty.",
+        "",
+        "From the red and black banners of Ako, this city wakes to order. Let every street, workshop, field, and ledger remember its place within the Dynasty's design.",
+        "",
+        "By discipline we prevent disorder. By labour we preserve strength. By loyalty we ensure that the city moves with one mind beneath the authority of Ako.",
+        "",
+        "Citizens are now directed to begin the approved daily patriotic music programme. Let its rhythm carry compliance, confidence, and unity through every district.",
+        "",
+        "Remain productive. Remain orderly. The Ako Dynasty advances."
+    }, "\n")
+end
+
+local function generateMorningBroadcast(clock, forced)
+    local history = readMorningHistory()
+
+    local morningSystem = [[
+You are JARVIS State Radio, the fictional official public-address broadcaster of a Minecraft town.
+
+Generate one fresh morning city broadcast.
+
+Purpose:
+- This message is for a town broadcasting system.
+- It will be played throughout the city over public speakers.
+- It exists to encourage civic order, compliance, morale, productivity, and continued loyalty.
+- It should direct citizens toward the daily patriotic/propaganda music programme near the end.
+
+Fictional state identity:
+- Nation: the Ako Dynasty.
+- Leader: Ako.
+- Colours: red and black.
+- Theme: East Asian dynastic/state-radio aesthetic.
+
+Style:
+- Grand, ceremonial, confident, official news-presenter tone.
+- Similar energy to an extremely loyal state broadcaster, but completely fictional and in-world.
+- Use imagery of banners, dawn, order, duty, workshops, streets, bells, ledgers, furnaces, citizens, and dynasty where useful.
+- Make it sound like a dramatic public broadcast opening echoing through a city.
+- It should be unique and not reuse previous wording.
+- Keep it between 100 and 170 words.
+
+Restrictions:
+- Do not reference real-world country names, real-world political parties, real-world ethnic claims, real leaders, or real regimes.
+- Do not mention China, North Korea, communism, fascism, or any real government.
+- Do not use markdown.
+- Do not use JSON.
+- Return only the broadcast text.
+]]
+
+    local userPrompt = table.concat({
+        "Create today's morning public broadcast for the city.",
+        "",
+        "Minecraft date: " .. tostring(clock.date_text),
+        "Minecraft time: " .. tostring(clock.time_text),
+        "Absolute Minecraft day: " .. tostring(clock.absolute_day),
+        "Forced test: " .. tostring(forced == true),
+        "Visible city speakers: " .. tostring(speakerCount()),
+        "",
+        "Avoid repeating these previous broadcasts:",
+        history ~= "" and history or "No previous broadcasts recorded.",
+    }, "\n")
+
+    local reply, err = callOpenAI({
+        {
+            role = "user",
+            content = userPrompt
+        }
+    }, morningSystem)
+
+    if not reply then
+        return fallbackMorningBroadcast(clock), "GPT morning generation failed: " .. tostring(err)
+    end
+
+    reply = trim(reply)
+
+    if reply == "" then
+        return fallbackMorningBroadcast(clock), "GPT morning generation returned empty text."
+    end
+
+    return reply, nil
+end
+
+local function printMorningBroadcast(forced)
+    local c = minecraftClock()
+
+    print("")
+    line()
+    print("JARVIS MORNING TOWN BROADCAST")
+    print("Nation: " .. NATION_NAME)
+    print("Leader: " .. LEADER_NAME)
+    print("Colours: " .. STATE_COLOURS)
+    print("Purpose: city-wide compliance and loyalty broadcast")
+    print("Visible speakers: " .. tostring(speakerCount()))
+    print("Date: " .. c.date_text .. "  Time: " .. c.time_text)
+    print("")
+
+    -- Small sound cue on the speaker network.
+    playOnAllSpeakers("minecraft:block.note_block.chime", 1, 1.0)
+    sleep(0.15)
+    playOnAllSpeakers("minecraft:block.note_block.chime", 1, 1.25)
+
+    print("Composing fresh public broadcast...")
+    local speech, err = generateMorningBroadcast(c, forced)
+
+    print("")
+    print(speech)
+    print("")
+
+    if err then
+        print("NOTICE: " .. err)
+        print("")
+    end
+
+    print(musicAttentionText())
+
+    if tryOpenMusicTab() then
+        print("Daily music programme opened in a new tab.")
+    else
+        print("Music command: " .. MUSIC_PLAYER_PROGRAM)
+    end
+
+    if not forced then
+        appendMorningHistory(c.absolute_day, speech)
+    else
+        print("")
+        print("(Forced test broadcast. Daily trigger state/history was not changed.)")
+    end
+
+    line()
+    print("")
+end
+
+local function shouldRunMorningBroadcast()
+    if not MORNING_ENABLED then return false end
+
+    local c = minecraftClock()
+    local last = lastMorningDay()
+
+    if last == c.absolute_day then
         return false
     end
 
-    local found = {}
-
-    for _, item in ipairs(data) do
-        if type(item) == "table" and item.type == "file" and type(item.name) == "string" then
-            if item.name:lower():match("%.dfpwm$") then
-                table.insert(found, {
-                    name = item.name,
-                    display = niceName(item.name),
-                    size = item.size or 0,
-                    url = makeRawUrl(item.name),
-                })
-            end
-        end
+    if c.hour >= MORNING_START_HOUR and c.hour < MORNING_END_HOUR then
+        return true, c
     end
 
-    table.sort(found, function(a, b)
-        return a.display:lower() < b.display:lower()
-    end)
-
-    tracks = found
-
-    if #tracks == 0 then
-        state.status = "No tracks"
-        state.lastError = "No .dfpwm files found in repo root."
-        addLog("No .dfpwm tracks found.")
-    else
-        state.current = clamp(state.current, 1, #tracks)
-        ensureCurrentVisible()
-        state.status = "Ready"
-        state.lastError = ""
-        addLog("Loaded " .. #tracks .. " track(s). Click one to play.")
-    end
-
-    wake()
-    return #tracks > 0
+    return false
 end
 
-local function draw()
-    buttons = {}
-    local w, h = term.getSize()
+local function morningBroadcastLoop()
+    while true do
+        local ok, c = shouldRunMorningBroadcast()
 
-    term.setBackgroundColor(colors.black)
-    term.setTextColor(colors.white)
+        if ok and c then
+            printMorningBroadcast(false)
+            saveMorningDay(c.absolute_day)
+        end
+
+        sleep(MORNING_CHECK_SECONDS)
+    end
+end
+
+-- =============================================================================
+-- CHAT LOOP
+-- =============================================================================
+
+local chatHistory = {}
+
+local function addMessage(role, content)
+    chatHistory[#chatHistory + 1] = {
+        role = role,
+        content = content
+    }
+
+    -- Keep the base client light.
+    while #chatHistory > 12 do
+        table.remove(chatHistory, 1)
+    end
+end
+
+local function bootScreen()
     term.clear()
+    term.setCursorPos(1, 1)
 
-    clearLine(1, colors.gray)
-    writeAt(2, 1, "JARVIS RADIO STREAMER", colors.white, colors.gray)
-
-    local currentTrack = tracks[state.current]
-    local title = currentTrack and currentTrack.display or "No track selected"
-
-    writeAt(2, 3, state.playing and "Now Playing" or "Selected Track", colors.lightGray, colors.black)
-    writeAt(2, 4, trim(title, w - 4), state.playing and colors.lime or colors.white, colors.black)
-
-    local mode = state.useGithubRaw and "github/raw" or "rawgithub"
-    local info = "Status: " .. state.status ..
-        " | Vol: " .. string.format("%.1f", state.volume) ..
-        " | Tracks: " .. tostring(#tracks) ..
-        " | URL: " .. mode
-
-    writeAt(2, 5, trim(info, w - 4), colors.lightGray, colors.black)
-
-    if state.lastError ~= "" then
-        writeAt(2, 6, trim("Error: " .. state.lastError, w - 4), colors.red, colors.black)
-    else
-        writeAt(2, 6, trim("Keys: Space Play/Stop | N Next | T Test | U URL | R Refresh", w - 4), colors.gray, colors.black)
-    end
-
-    local listTop, listBottom = trackListArea()
-    for y = listTop, listBottom do clearLine(y, colors.black) end
-
-    local rows = listBottom - listTop + 1
-    for row = 1, rows do
-        local index = state.scroll + row
-        local track = tracks[index]
-        local y = listTop + row - 1
-
-        if track then
-            local isCurrent = index == state.current
-            local prefix = isCurrent and "> " or "  "
-            local sizeText = track.size and track.size > 0 and (" [" .. math.floor(track.size / 1024) .. "KB]") or ""
-            local fg = isCurrent and colors.black or colors.white
-            local bg = isCurrent and colors.lime or colors.black
-            writeAt(2, y, trim(prefix .. track.display .. sizeText, w - 4), fg, bg)
-        end
-    end
-
-    local logTop, logBottom = logArea()
-    if logTop <= logBottom then
-        clearLine(logTop - 1, colors.gray)
-        writeAt(2, logTop - 1, "Log", colors.white, colors.gray)
-
-        for y = logTop, logBottom do clearLine(y, colors.black) end
-
-        local start = math.max(1, #logs - (logBottom - logTop))
-        local y = logTop
-        for i = start, #logs do
-            writeAt(2, y, trim(logs[i], w - 4), colors.lightGray, colors.black)
-            y = y + 1
-            if y > logBottom then break end
-        end
-    end
-
-    clearLine(h - 3, colors.gray)
-    clearLine(h - 2, colors.gray)
-    clearLine(h - 1, colors.gray)
-    clearLine(h, colors.gray)
-
-    local y = h - 2
-    local x = 2
-
-    addButton("prev", x, y, 7, " Prev ", colors.white, colors.gray)
-    x = x + 8
-
-    if state.playing then
-        addButton("stop", x, y, 7, " Stop ", colors.white, colors.red)
-    else
-        addButton("play", x, y, 7, " Play ", colors.white, colors.green)
-    end
-    x = x + 8
-
-    addButton("next", x, y, 7, " Next ", colors.white, colors.gray)
-    x = x + 8
-
-    addButton("test", x, y, 7, " Test ", colors.white, colors.orange)
-    x = x + 8
-
-    addButton("urlmode", x, y, 6, " URL ", colors.white, colors.brown)
-    x = x + 7
-
-    addButton("voldown", x, y, 4, " - ", colors.white, colors.gray)
-    x = x + 5
-
-    addButton("volup", x, y, 4, " + ", colors.white, colors.gray)
-
-    writeAt(2, h, "Click track to play immediately. Ctrl+T exits.", colors.lightGray, colors.gray)
+    print("JARVIS TOWN BROADCAST CORE")
+    print("Version: " .. VERSION)
+    print("Model: " .. MODEL)
+    print("")
+    print("Mode: clean chat + GPT morning city broadcast")
+    print("Nation: " .. NATION_NAME)
+    print("Leader: " .. LEADER_NAME)
+    print("Colours: " .. STATE_COLOURS)
+    print("Theme: " .. CULTURAL_THEME)
+    print("")
+    print("Broadcast role:")
+    print("  City-wide order, compliance, morale, and loyalty messaging")
+    print("")
+    print("Wired speaker peripherals visible: " .. tostring(speakerCount()))
+    print("")
+    print("No turtles. No squads. No TTS. No monitors. No databanks.")
+    print("")
+    print("Commands:")
+    print("  exit      - close JARVIS")
+    print("  clear     - clear chat history")
+    print("  raw       - show latest raw response file")
+    print("  time      - show Minecraft date/time")
+    print("  morning   - force fresh GPT city broadcast")
+    print("  music     - show daily music prompt")
+    print("  speakers  - rescan/list visible speakers")
+    print("  testspk   - play test sound on all speakers")
+    print("  stopspk   - stop all speakers")
+    print("")
+    line()
 end
 
-local function stopPlayback()
-    state.playing = false
-    state.status = "Stopped"
-    state.token = state.token + 1
-    speaker.stop()
-    addLog("Stopped.")
-    wake()
-end
+local function chatLoop()
+    bootScreen()
 
-local function changeVolume(delta)
-    local old = state.volume
-    state.volume = clamp(state.volume + delta, 0.0, 3.0)
+    while true do
+        write("> ")
+        local input = read()
 
-    if math.abs(state.volume - old) < 0.0001 then
-        addLog("Volume already " .. string.format("%.1f", state.volume))
-        wake()
-        return
-    end
+        if input then
+            input = trim(input)
+            local lower = input:lower()
 
-    -- CC speaker volume is applied when a buffer is queued.
-    -- If music is already playing, old buffers may still be queued at the old
-    -- volume. Stop clears the speaker buffer, and the stream continues with
-    -- the next chunk at the new volume. This gives an immediate volume change.
-    if state.playing then
-        speaker.stop()
-        os.queueEvent("speaker_audio_empty")
-        addLog("Volume " .. string.format("%.1f", state.volume) .. " applied.")
-    else
-        addLog("Volume " .. string.format("%.1f", state.volume))
-    end
+            if input == "" then
+                -- ignore empty input
 
-    wake()
-end
+            elseif lower == "exit" then
+                print("JARVIS offline.")
+                return
 
-local function playCurrent()
-    if #tracks == 0 then
-        state.status = "No tracks"
-        state.lastError = "No tracks loaded."
-        addLog("Play failed: no tracks.")
-        wake()
-        return
-    end
+            elseif lower == "clear" then
+                chatHistory = {}
+                print("Chat history cleared.")
 
-    state.current = clamp(state.current, 1, #tracks)
-    ensureCurrentVisible()
+            elseif lower == "raw" then
+                print("Latest raw response file: " .. RAW_RESPONSE_FILE)
 
-    local track = tracks[state.current]
-    state.playing = true
-    state.status = "Connecting..."
-    state.lastError = ""
-    state.token = state.token + 1
-    speaker.stop()
-    addLog("Opening: " .. track.display)
-    wake()
-end
+            elseif lower == "time" then
+                local c = minecraftClock()
+                print("Minecraft date/time: " .. c.full_text .. " | Abs day " .. tostring(c.absolute_day))
 
-local function nextTrack()
-    if #tracks == 0 then return end
+            elseif lower == "morning" then
+                printMorningBroadcast(true)
 
-    if state.shuffle and #tracks > 1 then
-        local old = state.current
-        repeat
-            state.current = math.random(1, #tracks)
-        until state.current ~= old
-    else
-        state.current = state.current + 1
-        if state.current > #tracks then state.current = 1 end
-    end
+            elseif lower == "music" then
+                print(musicAttentionText())
+                print("Music command: " .. MUSIC_PLAYER_PROGRAM)
 
-    playCurrent()
-end
+            elseif lower == "speakers" then
+                rescanSpeakers()
 
-local function previousTrack()
-    if #tracks == 0 then return end
+            elseif lower == "testspk" then
+                testSpeakers()
 
-    state.current = state.current - 1
-    if state.current < 1 then state.current = #tracks end
+            elseif lower == "stopspk" then
+                stopAllSpeakers()
 
-    playCurrent()
-end
-
-local function afterTrackFinished()
-    addLog("Track finished.")
-
-    if state.loopTrack then
-        playCurrent()
-        return
-    end
-
-    if state.shuffle then
-        nextTrack()
-        return
-    end
-
-    if state.current < #tracks then
-        state.current = state.current + 1
-        playCurrent()
-    else
-        state.playing = false
-        state.status = "Stopped"
-        speaker.stop()
-        wake()
-    end
-end
-
-local function testCurrentStream()
-    if #tracks == 0 then
-        state.lastError = "No track to test."
-        addLog("Test failed: no track.")
-        wake()
-        return
-    end
-
-    local track = tracks[state.current]
-    addLog("Testing stream...")
-    state.status = "Testing..."
-    state.lastError = ""
-    wake()
-
-    local handle = httpGetBinary(track.url)
-    if not handle then
-        state.status = "Test failed"
-        state.lastError = "Could not connect to stream URL."
-        addLog("Test failed: no HTTP handle.")
-        wake()
-        return
-    end
-
-    local code = getResponseCode(handle)
-    local chunk = handle.read(128)
-    handle.close()
-
-    if chunk and #chunk > 0 then
-        state.status = "Test OK"
-        state.lastError = ""
-        addLog("Test OK. HTTP " .. tostring(code) .. ", " .. tostring(#chunk) .. " bytes.")
-    else
-        state.status = "Test empty"
-        state.lastError = "Connected, but received no data."
-        addLog("Test empty. HTTP " .. tostring(code))
-    end
-
-    wake()
-end
-
-local function audioThread()
-    while state.running do
-        if not state.playing or #tracks == 0 then
-            os.pullEvent("radio_wake")
-        else
-            local track = tracks[state.current]
-            local token = state.token
-
-            state.status = "Connecting..."
-            state.lastError = ""
-            wake()
-
-            local handle = httpGetBinary(track.url)
-
-            if not handle then
-                if state.playing and token == state.token then
-                    state.status = "Stream failed"
-                    state.lastError = "Could not open stream URL. Press U then try again."
-                    state.playing = false
-                    speaker.stop()
-                    addLog("Stream failed: no HTTP handle.")
-                    wake()
-                end
             else
-                local code = getResponseCode(handle)
-                addLog("Stream opened. HTTP " .. tostring(code))
-                state.status = "Buffering..."
-                wake()
+                addMessage("user", input)
 
-                local decoder = dfpwm.make_decoder()
-                local finishedNaturally = true
-                local chunks = 0
-                local bytes = 0
+                print("Thinking...")
 
-                while true do
-                    if not state.playing or token ~= state.token then
-                        finishedNaturally = false
-                        break
-                    end
+                local reply, err = callOpenAI(chatHistory)
 
-                    local chunk = handle.read(16 * 1024)
-                    if not chunk then break end
-
-                    chunks = chunks + 1
-                    bytes = bytes + #chunk
-
-                    if chunks == 1 then
-                        state.status = "Playing"
-                        addLog("Audio chunk received: " .. tostring(#chunk) .. " bytes.")
-                        wake()
-                    end
-
-                    local buffer = decoder(chunk)
-
-                    while not speaker.playAudio(buffer, state.volume) do
-                        if not waitForSpeakerSpace(token) then
-                            finishedNaturally = false
-                            break
-                        end
-                    end
-
-                    if not finishedNaturally then break end
-                end
-
-                handle.close()
-
-                if chunks == 0 and state.playing and token == state.token then
-                    state.status = "No audio data"
-                    state.lastError = "Stream opened but returned zero chunks."
-                    state.playing = false
-                    speaker.stop()
-                    addLog("No chunks received.")
-                    wake()
-                elseif finishedNaturally and state.playing and token == state.token then
-                    speaker.stop()
-                    addLog("Received " .. tostring(math.floor(bytes / 1024)) .. "KB total.")
-                    afterTrackFinished()
+                if not reply then
+                    print("ERROR: " .. s(err))
                 else
-                    addLog("Playback thread released.")
+                    addMessage("assistant", reply)
+                    print("")
+                    print("JARVIS:")
+                    print(reply)
+                    print("")
                 end
             end
         end
     end
 end
 
-local function handleButton(id)
-    if id == "play" then
-        if state.playing then stopPlayback() else playCurrent() end
-    elseif id == "stop" then
-        stopPlayback()
-    elseif id == "next" then
-        nextTrack()
-    elseif id == "prev" then
-        previousTrack()
-    elseif id == "test" then
-        testCurrentStream()
-    elseif id == "urlmode" then
-        state.useGithubRaw = not state.useGithubRaw
-        refreshTrackUrls()
-        addLog("URL mode switched.")
-        wake()
-    elseif id == "voldown" then
-        changeVolume(-0.1)
-    elseif id == "volup" then
-        changeVolume(0.1)
-    end
+-- =============================================================================
+-- STARTUP
+-- =============================================================================
+
+math.randomseed(os.epoch and os.epoch("utc") or math.floor(os.clock() * 100000))
+
+print("Scanning wired speaker network...")
+local foundSpeakers = scanSpeakers()
+print("Speaker scan complete: " .. tostring(foundSpeakers) .. " speaker(s) visible.")
+sleep(0.5)
+
+local ok, err = pcall(function()
+    parallel.waitForAny(chatLoop, morningBroadcastLoop)
+end)
+
+if not ok then
+    term.setTextColor(colors.red)
+    print("JARVIS error: " .. s(err))
+    term.setTextColor(colors.white)
 end
-
-local function handleKey(key)
-    if key == keys.space then
-        if state.playing then stopPlayback() else playCurrent() end
-    elseif key == keys.n then
-        nextTrack()
-    elseif key == keys.b then
-        previousTrack()
-    elseif key == keys.s then
-        state.shuffle = not state.shuffle
-        addLog("Shuffle " .. (state.shuffle and "ON" or "OFF"))
-        wake()
-    elseif key == keys.l then
-        state.loopTrack = not state.loopTrack
-        addLog("Loop " .. (state.loopTrack and "ON" or "OFF"))
-        wake()
-    elseif key == keys.r then
-        loadTracksFromApi()
-    elseif key == keys.t then
-        testCurrentStream()
-    elseif key == keys.u then
-        state.useGithubRaw = not state.useGithubRaw
-        refreshTrackUrls()
-        addLog("URL mode switched.")
-        wake()
-    elseif key == keys.minus then
-        changeVolume(-0.1)
-    elseif key == keys.equals then
-        changeVolume(0.1)
-    end
-end
-
-local function uiThread()
-    draw()
-
-    while state.running do
-        local event, a, b, c = os.pullEvent()
-
-        if event == "radio_redraw" or event == "term_resize" then
-            draw()
-
-        elseif event == "mouse_scroll" then
-            local direction = a
-            local listTop, listBottom = trackListArea()
-            local rows = listBottom - listTop + 1
-            state.scroll = clamp(state.scroll + direction, 0, math.max(0, #tracks - rows))
-            draw()
-
-        elseif event == "mouse_click" then
-            local button, x, y = a, b, c
-            local id = buttonAt(x, y)
-
-            if id then
-                handleButton(id)
-                draw()
-            else
-                local listTop, listBottom = trackListArea()
-                if y >= listTop and y <= listBottom then
-                    local index = state.scroll + (y - listTop + 1)
-                    if tracks[index] then
-                        state.current = index
-                        ensureCurrentVisible()
-                        playCurrent()
-                        draw()
-                    end
-                end
-            end
-
-        elseif event == "key" then
-            handleKey(a)
-            draw()
-        end
-    end
-end
-
-math.randomseed(os.epoch("utc"))
-
-addLog("Booting radio streamer...")
-loadTracksFromApi()
-
-parallel.waitForAny(audioThread, uiThread)
-
-speaker.stop()
-term.setBackgroundColor(colors.black)
-term.setTextColor(colors.white)
-term.clear()
-term.setCursorPos(1, 1)
-print("JARVIS Radio closed.")
