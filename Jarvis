@@ -1,19 +1,19 @@
 -- =============================================================================
--- JARVIS BASE CORE + GPT MORNING STATE BROADCAST
--- Minimal ComputerCraft OpenAI chat client
+-- JARVIS TOWN BROADCAST CORE
+-- Minimal ComputerCraft OpenAI chat client + GPT civic morning broadcast
+--
+-- Purpose:
+--   JARVIS is being rebuilt as a town/state broadcasting intelligence.
+--   This version stays mostly barebones, but adds the first broadcast behaviour:
+--   once per Minecraft morning, generate a fresh city-wide loyalty/compliance
+--   announcement for the Ako Dynasty and direct citizens toward daily music.
 --
 -- Keeps:
---   - safe GitHub self-updater
+--   - SAFE GITHUB SELF-UPDATER
 --   - API key loading via require("JarvisKey")
 --   - OpenAI request
 --   - simple chat console loop
---   - once-per-Minecraft-day GPT-generated morning patriotic radio address
---
--- Nation identity:
---   Leader: Ako
---   Nation: The Ako Dynasty
---   Colours: Red and Black
---   Theme: East Asian dynastic/state-radio aesthetic
+--   - once-per-Minecraft-day GPT-generated morning town broadcast
 --
 -- Removed:
 --   - turtle/squad/fleet code
@@ -23,6 +23,12 @@
 --   - TTS
 --   - environment scanning
 --   - local Lua execution tools
+--
+-- Nation identity:
+--   Leader: Ako
+--   Nation: the Ako Dynasty
+--   Colours: red and black
+--   Theme: East Asian dynastic/state-radio aesthetic
 --
 -- Required file:
 --   JarvisKey.lua
@@ -52,14 +58,12 @@
 --   clear     - clear chat history
 --   raw       - show latest raw response file
 --   time      - show Minecraft date/time
---   morning   - force a fresh GPT morning address
+--   morning   - force a fresh GPT morning town broadcast
 --   music     - remind/start attention toward daily music
 --
--- IMPORTANT:
---   Change UPDATE_URL below to your raw GitHub URL once your new JARVIS repo/path exists.
 -- =============================================================================
 
-local VERSION = "1.2.0-gpt-morning-ako-dynasty"
+local VERSION = "1.3.0-town-broadcast-ako"
 local args = {...}
 
 -- =============================================================================
@@ -69,10 +73,15 @@ local args = {...}
 local KEY_FILE = "JarvisKey.lua"
 local RAW_RESPONSE_FILE = "jarvis_latest_raw_response.txt"
 
--- CHANGE THIS when the new JARVIS GitHub file exists.
+-- SELF-UPDATER CONFIG
+-- Put your actual raw GitHub JARVIS file here.
 -- Example:
--- local UPDATE_URL = "https://raw.githubusercontent.com/JoshuaMEtaylor/JarvisCC/refs/heads/main/Jarvis"
+--   https://raw.githubusercontent.com/JoshuaMEtaylor/JarvisCC/refs/heads/main/Jarvis
+--
+-- This updater is ACTIVE. If the URL is wrong, it will safely keep the local copy.
+local UPDATE_ENABLED = true
 local UPDATE_URL = "https://raw.githubusercontent.com/JoshuaMEtaylor/JarvisCC/refs/heads/main/Jarvis"
+local UPDATE_SKIP_ARG = "--updated"
 
 local MODEL = "gpt-4o-mini"
 
@@ -83,10 +92,10 @@ local MORNING_END_HOUR = 9
 local MORNING_CHECK_SECONDS = 10
 local MORNING_STATE_FILE = "jarvis_morning_last_day.txt"
 local MORNING_HISTORY_FILE = "jarvis_morning_history.txt"
-local MORNING_HISTORY_MAX_CHARS = 2500
+local MORNING_HISTORY_MAX_CHARS = 3000
 
--- Music player integration is intentionally light.
--- It will not auto-run by default because MusicPlayer uses the same terminal.
+-- Music player integration is intentionally light for now.
+-- The current MusicPlayer uses the same terminal, so JARVIS points attention to it.
 local MUSIC_PLAYER_PROGRAM = "MusicPlayer"
 local AUTO_OPEN_MUSIC_TAB = false -- only works if multishell exists
 
@@ -101,20 +110,26 @@ You are JARVIS, a concise Minecraft ComputerCraft assistant.
 
 You have been reset to base mode.
 You do not currently control turtles, squads, monitors, speakers, banking systems, economy systems, or external ComputerCraft devices.
-You are only a chat assistant running in a ComputerCraft terminal.
+You are only a chat assistant running in a ComputerCraft terminal unless later integrations are added.
 
-Your current added role is light state-radio personality for a fictional Minecraft nation:
+Your current purpose is to become the voice of a fictional town broadcasting system.
+The broadcasts are played throughout the city to maintain civic order, compliance, morale, productivity, and continued loyalty to the Ako Dynasty.
+
+Fictional state identity:
 - Nation: the Ako Dynasty.
 - Leader: Ako.
 - Colours: red and black.
 - Theme: East Asian dynastic/state-radio aesthetic.
-- You may speak with ceremonial, patriotic, official-broadcast flair.
-- Do not reference real-world regimes, real-world governments, real ethnic groups, or real political parties.
-- Keep it fictional, in-world, theatrical, and useful.
-- Do not claim access to old JARVIS systems unless the user gives new code/data.
-- Do not claim you actually control music, speakers, towns, monitors, or the economy unless those integrations are later added.
 
-Keep replies useful, direct, and conversational.
+Style rules:
+- Speak like a dramatic, ceremonial, loyal state broadcaster inside a fictional Minecraft nation.
+- Keep it in-world and theatrical.
+- Do not reference real-world regimes, countries, ethnic groups, political parties, real leaders, or real propaganda movements.
+- Do not mention China, North Korea, communism, fascism, or any real government.
+- Do not claim you control speakers, music, monitors, economy, or town systems unless that integration is actually added later.
+- You may talk about future public broadcast duties as a role, not as already-working hardware.
+
+Keep normal chat replies useful, direct, and conversational.
 ]]
 
 -- =============================================================================
@@ -152,14 +167,6 @@ local function writeFile(path, text)
     return true
 end
 
-local function appendFile(path, text)
-    local f = fs.open(path, "a")
-    if not f then return false end
-    f.write(text or "")
-    f.close()
-    return true
-end
-
 local function trim(str)
     str = tostring(str or "")
     str = str:gsub("^%s+", "")
@@ -183,7 +190,12 @@ end
 -- =============================================================================
 
 local function selfUpdate()
-    if hasArg("--updated") then
+    if not UPDATE_ENABLED then
+        return
+    end
+
+    if hasArg(UPDATE_SKIP_ARG) then
+        print("Auto-update skipped for freshly relaunched copy.")
         return
     end
 
@@ -192,17 +204,20 @@ local function selfUpdate()
         return
     end
 
-    if not UPDATE_URL or UPDATE_URL == "" or UPDATE_URL:find("JarvisCC", 1, true) then
-        print("Updater URL still looks like the default placeholder.")
-        print("Set UPDATE_URL near the top of this file when your GitHub repo is ready.")
-        print("Skipping update.")
+    if not shell or not shell.run then
+        print("Shell API unavailable. Skipping update.")
         return
     end
 
-    local program = shell and shell.getRunningProgram and shell.getRunningProgram() or "Jarvis"
+    if not UPDATE_URL or UPDATE_URL == "" then
+        print("No UPDATE_URL set. Skipping update.")
+        return
+    end
+
+    local program = shell.getRunningProgram and shell.getRunningProgram() or "Jarvis"
     if not program or program == "" then program = "Jarvis" end
 
-    print("[ JARVIS ]")
+    print("[ JARVIS Town Broadcast Core ]")
     print("Checking GitHub update...")
 
     local tmp = program .. ".new"
@@ -211,15 +226,17 @@ local function selfUpdate()
     fs.delete(tmp)
 
     local cb = tostring(os.epoch and os.epoch("utc") or math.floor(os.clock() * 100000))
-    local url = UPDATE_URL .. "?cb=" .. cb
+    local sep = UPDATE_URL:find("?", 1, true) and "&" or "?"
+    local url = UPDATE_URL .. sep .. "cb=" .. cb
 
     local handle = http.get(url, {
-        ["User-Agent"] = "CC-Tweaked-JARVIS-Base-Updater",
+        ["User-Agent"] = "CC-Tweaked-JARVIS-Town-Broadcast-Updater",
         ["Cache-Control"] = "no-cache",
     })
 
     if not handle then
-        print("Update check failed. Starting local copy.")
+        print("Update failed: no HTTP response.")
+        print("Keeping existing local copy.")
         sleep(0.5)
         return
     end
@@ -231,18 +248,21 @@ local function selfUpdate()
         body and
         #body > 1000 and
         not body:find("404: Not Found", 1, true) and
-        not body:find("<!DOCTYPE html", 1, true)
+        not body:find("<!DOCTYPE html", 1, true) and
+        not body:find("<html", 1, true)
 
     if not okDownload then
+        fs.delete(tmp)
         print("Update rejected: empty, invalid, or not raw Lua.")
-        print("Starting local copy.")
+        print("Keeping existing local copy.")
         sleep(0.5)
         return
     end
 
     local f = fs.open(tmp, "w")
     if not f then
-        print("Could not write update file. Starting local copy.")
+        print("Could not write temporary update file.")
+        print("Keeping existing local copy.")
         return
     end
 
@@ -259,7 +279,15 @@ local function selfUpdate()
     print("Updated. Relaunching...")
     sleep(0.5)
 
-    shell.run(program, "--updated")
+    local relaunch = { program, UPDATE_SKIP_ARG }
+    for i = 1, #args do
+        if tostring(args[i]) ~= UPDATE_SKIP_ARG then
+            relaunch[#relaunch + 1] = tostring(args[i])
+        end
+    end
+
+    local unpackFn = table.unpack or unpack
+    shell.run(unpackFn(relaunch))
     return "updated"
 end
 
@@ -537,7 +565,7 @@ local function minecraftClock()
 end
 
 -- =============================================================================
--- GPT MORNING STATE BROADCAST
+-- GPT MORNING TOWN BROADCAST
 -- =============================================================================
 
 local function lastMorningDay()
@@ -587,11 +615,13 @@ local function fallbackMorningBroadcast(clock)
     return table.concat({
         "Good morning, citizens of the Ako Dynasty.",
         "",
-        "Under the red and black banners of Ako, the new day rises with order, strength, and purpose. Let every workshop, field, ledger, and machine remember its place in the greater harmony of the Dynasty.",
+        "From the red and black banners of Ako, this city wakes to order. Let every street, workshop, field, and ledger remember its place within the Dynasty's design.",
         "",
-        "The State calls for disciplined labour, clean accounts, and loyal hearts. Begin now with the approved daily patriotic music programme, and let its rhythm carry the will of Ako through every street.",
+        "By discipline we prevent disorder. By labour we preserve strength. By loyalty we ensure that the city moves with one mind beneath the authority of Ako.",
         "",
-        "Remain productive. Remain orderly. The Dynasty advances."
+        "Citizens are now directed to begin the approved daily patriotic music programme. Let its rhythm carry compliance, confidence, and unity through every district.",
+        "",
+        "Remain productive. Remain orderly. The Ako Dynasty advances."
     }, "\n")
 end
 
@@ -599,30 +629,40 @@ local function generateMorningBroadcast(clock, forced)
     local history = readMorningHistory()
 
     local morningSystem = [[
-You are JARVIS State Radio, the fictional official morning broadcaster of a Minecraft nation.
+You are JARVIS State Radio, the fictional official public-address broadcaster of a Minecraft town.
 
-Generate one fresh morning patriotic radio address.
+Generate one fresh morning city broadcast.
 
-Identity:
+Purpose:
+- This message is for a town broadcasting system.
+- It will be played throughout the city over public speakers.
+- It exists to encourage civic order, compliance, morale, productivity, and continued loyalty.
+- It should direct citizens toward the daily patriotic/propaganda music programme near the end.
+
+Fictional state identity:
 - Nation: the Ako Dynasty.
 - Leader: Ako.
 - Colours: red and black.
 - Theme: East Asian dynastic/state-radio aesthetic.
 
 Style:
-- Grand, ceremonial, confident, state-news-presenter tone.
-- Similar energy to an extremely loyal official broadcaster, but completely fictional.
-- Avoid real-world country names, real-world political parties, real-world ethnic claims, and real-world leaders.
-- Do not mention China, North Korea, communism, fascism, or any real regime.
-- Make it sound like a dramatic in-universe morning news/radio opening.
+- Grand, ceremonial, confident, official news-presenter tone.
+- Similar energy to an extremely loyal state broadcaster, but completely fictional and in-world.
+- Use imagery of banners, dawn, order, duty, workshops, streets, bells, ledgers, furnaces, citizens, and dynasty where useful.
+- Make it sound like a dramatic public broadcast opening echoing through a city.
 - It should be unique and not reuse previous wording.
-- It should direct citizens toward the daily patriotic/propaganda music programme near the end.
-- Keep it between 90 and 150 words.
-- Return only the broadcast text. No markdown. No JSON.
+- Keep it between 100 and 170 words.
+
+Restrictions:
+- Do not reference real-world country names, real-world political parties, real-world ethnic claims, real leaders, or real regimes.
+- Do not mention China, North Korea, communism, fascism, or any real government.
+- Do not use markdown.
+- Do not use JSON.
+- Return only the broadcast text.
 ]]
 
     local userPrompt = table.concat({
-        "Create today's morning address.",
+        "Create today's morning public broadcast for the city.",
         "",
         "Minecraft date: " .. tostring(clock.date_text),
         "Minecraft time: " .. tostring(clock.time_text),
@@ -658,14 +698,15 @@ local function printMorningBroadcast(forced)
 
     print("")
     line()
-    print("JARVIS MORNING STATE BROADCAST")
+    print("JARVIS MORNING TOWN BROADCAST")
     print("Nation: " .. NATION_NAME)
     print("Leader: " .. LEADER_NAME)
     print("Colours: " .. STATE_COLOURS)
+    print("Purpose: city-wide compliance and loyalty broadcast")
     print("Date: " .. c.date_text .. "  Time: " .. c.time_text)
     print("")
 
-    print("Composing fresh broadcast...")
+    print("Composing fresh public broadcast...")
     local speech, err = generateMorningBroadcast(c, forced)
 
     print("")
@@ -748,15 +789,18 @@ local function bootScreen()
     term.clear()
     term.setCursorPos(1, 1)
 
-    print("JARVIS BASE CORE")
+    print("JARVIS TOWN BROADCAST CORE")
     print("Version: " .. VERSION)
     print("Model: " .. MODEL)
     print("")
-    print("Mode: clean chat + GPT morning state broadcast")
+    print("Mode: clean chat + GPT morning city broadcast")
     print("Nation: " .. NATION_NAME)
     print("Leader: " .. LEADER_NAME)
     print("Colours: " .. STATE_COLOURS)
     print("Theme: " .. CULTURAL_THEME)
+    print("")
+    print("Broadcast role:")
+    print("  City-wide order, compliance, morale, and loyalty messaging")
     print("")
     print("No turtles. No squads. No TTS. No monitors. No databanks.")
     print("")
@@ -765,7 +809,7 @@ local function bootScreen()
     print("  clear     - clear chat history")
     print("  raw       - show latest raw response file")
     print("  time      - show Minecraft date/time")
-    print("  morning   - force fresh GPT morning address")
+    print("  morning   - force fresh GPT city broadcast")
     print("  music     - show daily music prompt")
     print("")
     line()
