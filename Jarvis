@@ -1,12 +1,12 @@
 -- =============================================================================
 -- JARVIS TOWN BROADCAST CORE
--- Wired Speaker Network + TTS + Integrated Music
+-- Wired Speaker Network + OpenAI TTS + Integrated Music
 --
 -- Fixed build:
 --   - valid Lua syntax
 --   - no external MusicPlayer prompt
---   - TTS is split into short requests
---   - morning broadcast is spoken aloud
+--   - OpenAI neural TTS is split into safe requests
+--   - morning broadcast is spoken aloud with OpenAI TTS
 --   - JARVIS directly picks a random .dfpwm song from GitHub and streams it
 --
 -- Required:
@@ -31,7 +31,7 @@
 --   stopmusic
 -- =============================================================================
 
-local VERSION = "1.6.0-integrated-music-fixed"
+local VERSION = "1.7.0-openai-tts-selfupdate"
 local args = {...}
 
 -- =============================================================================
@@ -42,18 +42,37 @@ local KEY_FILE = "JarvisKey.lua"
 local RAW_RESPONSE_FILE = "jarvis_latest_raw_response.txt"
 
 local UPDATE_ENABLED = true
-local UPDATE_URL = "https://raw.githubusercontent.com/JoshuaMEtaylor/JarvisCC/refs/heads/main/Jarvis"
+local UPDATE_URL = "https://raw.githubusercontent.com/JoshuaMEtaylor/MusicPlayerCC/refs/heads/main/Jarvis"
 local UPDATE_SKIP_ARG = "--updated"
 
 local MODEL = "gpt-4o-mini"
 
 local TTS_ENABLED = true
 local TTS_VOLUME = 1.0
-local TTS_SINGLE_REQUEST_MAX_CHARS = 160
-local TTS_TOTAL_MAX_CHARS = 2200
-local TTS_URL_BASE = "https://music.madefor.cc/tts?text="
-local TTS_CHUNK_SIZE = 16 * 1024
+local TTS_SINGLE_REQUEST_MAX_CHARS = 600
+local TTS_TOTAL_MAX_CHARS = 2600
 local AUDIO_WAIT_TIMEOUT = 0.35
+
+-- OpenAI neural TTS.
+-- Voices worth trying: cedar, marin, onyx, ballad, verse, coral, nova.
+local TTS_PROVIDER = "openai"
+local OPENAI_TTS_URL = "https://api.openai.com/v1/audio/speech"
+local OPENAI_TTS_MODEL = "gpt-4o-mini-tts"
+local OPENAI_TTS_VOICE = "cedar"
+local OPENAI_TTS_RESPONSE_FORMAT = "pcm"
+local OPENAI_TTS_SPEED = 1.0
+local OPENAI_TTS_PCM_CHUNK_SIZE = 8192
+local OPENAI_TTS_INSTRUCTIONS = [=[
+Speak as JARVIS, the official AI public-address voice of the fictional Ako Dynasty.
+Tone: calm, ceremonial, authoritative, disciplined, elegant, and state-radio formal.
+Delivery: measured pace, clear diction, serious public broadcaster cadence, not excited, not cartoonish.
+Style: suitable for an East Asian dynastic city-state with red and black banners.
+]=]
+
+-- Emergency fallback if OpenAI TTS fails.
+local LEGACY_TTS_FALLBACK_ENABLED = true
+local LEGACY_TTS_URL_BASE = "https://music.madefor.cc/tts?text="
+local LEGACY_TTS_CHUNK_SIZE = 16 * 1024
 
 local MORNING_ENABLED = true
 local MORNING_START_HOUR = 6
@@ -860,6 +879,12 @@ end
 
 -- =============================================================================
 -- TTS OVER WIRED SPEAKER NETWORK
+-- OpenAI speech endpoint returns raw PCM: 24kHz, 16-bit signed little-endian.
+-- CC speakers expect 48kHz 8-bit signed sample buffers, so this code:
+--   1. reads OpenAI PCM bytes,
+--   2. converts 16-bit signed samples to 8-bit signed samples,
+--   3. duplicates each sample to upsample 24kHz -> 48kHz,
+--   4. sends the resulting buffer to every visible wired speaker.
 -- =============================================================================
 
 local function cleanSpeechText(text)
@@ -886,6 +911,7 @@ local function splitSpeechChunks(text)
         local head = cleaned:sub(1, TTS_SINGLE_REQUEST_MAX_CHARS)
         local cut = nil
 
+        -- Prefer sentence boundaries.
         for i = #head, 1, -1 do
             local ch = head:sub(i, i)
             if ch == "." or ch == "!" or ch == "?" or ch == ";" or ch == ":" then
@@ -894,7 +920,8 @@ local function splitSpeechChunks(text)
             end
         end
 
-        if not cut or cut < 60 then
+        -- Fallback to the last space.
+        if not cut or cut < 120 then
             for i = #head, 1, -1 do
                 if head:sub(i, i) == " " then
                     cut = i
@@ -903,7 +930,7 @@ local function splitSpeechChunks(text)
             end
         end
 
-        if not cut or cut < 30 then cut = TTS_SINGLE_REQUEST_MAX_CHARS end
+        if not cut or cut < 80 then cut = TTS_SINGLE_REQUEST_MAX_CHARS end
 
         local chunk = trim(cleaned:sub(1, cut))
         if chunk ~= "" then chunks[#chunks + 1] = chunk end
@@ -916,42 +943,174 @@ local function splitSpeechChunks(text)
     return chunks
 end
 
-local function speakOneChunkToCity(cleaned, debug, chunkIndex, chunkCount)
+local function pcm16leToSpeakerBuffer(chunk, carryByte)
+    local out = {}
+    local i = 1
+
+    if carryByte ~= nil then
+        if #chunk >= 1 then
+            local lo = carryByte
+            local hi = chunk:byte(1)
+            local value = lo + hi * 256
+            if value >= 32768 then value = value - 65536 end
+
+            local sample = math.floor(value / 256)
+            if sample < -128 then sample = -128 end
+            if sample > 127 then sample = 127 end
+
+            out[#out + 1] = sample
+            out[#out + 1] = sample
+
+            carryByte = nil
+            i = 2
+        else
+            return out, carryByte
+        end
+    end
+
+    while i + 1 <= #chunk do
+        local lo = chunk:byte(i)
+        local hi = chunk:byte(i + 1)
+
+        local value = lo + hi * 256
+        if value >= 32768 then value = value - 65536 end
+
+        local sample = math.floor(value / 256)
+        if sample < -128 then sample = -128 end
+        if sample > 127 then sample = 127 end
+
+        -- OpenAI PCM is 24kHz. Duplicate each sample for CC's 48kHz speaker.
+        out[#out + 1] = sample
+        out[#out + 1] = sample
+
+        i = i + 2
+    end
+
+    if i <= #chunk then
+        carryByte = chunk:byte(i)
+    end
+
+    return out, carryByte
+end
+
+local function speakOneChunkOpenAI(cleaned, debug, chunkIndex, chunkCount)
     if debug then
-        print("[TTS] Requesting chunk " .. tostring(chunkIndex) .. "/" .. tostring(chunkCount) .. " (" .. tostring(#cleaned) .. " chars)...")
+        print("[TTS] OpenAI chunk " .. tostring(chunkIndex) .. "/" .. tostring(chunkCount) .. " (" .. tostring(#cleaned) .. " chars).")
+        print("[TTS] Voice: " .. tostring(OPENAI_TTS_VOICE) .. " | Model: " .. tostring(OPENAI_TTS_MODEL))
+    end
+
+    local body = textutils.serializeJSON({
+        model = OPENAI_TTS_MODEL,
+        voice = OPENAI_TTS_VOICE,
+        input = cleaned,
+        instructions = OPENAI_TTS_INSTRUCTIONS,
+        response_format = OPENAI_TTS_RESPONSE_FORMAT,
+        speed = OPENAI_TTS_SPEED,
+    })
+
+    local response = http.post(
+        OPENAI_TTS_URL,
+        body,
+        {
+            ["Content-Type"] = "application/json",
+            ["Authorization"] = "Bearer " .. API_KEY,
+            ["User-Agent"] = "CC-Tweaked-JARVIS-OpenAI-TTS",
+        },
+        true
+    )
+
+    if not response then
+        return false, "OpenAI TTS HTTP request failed."
+    end
+
+    local code = 200
+    if response.getResponseCode then
+        local okCode, c = pcall(function() return response.getResponseCode() end)
+        if okCode and c then code = tonumber(c) or c end
+    end
+
+    if debug then print("[TTS] OpenAI HTTP " .. tostring(code)) end
+
+    if tostring(code) ~= "200" then
+        local errBody = ""
+        pcall(function() errBody = response.readAll() or "" end)
+        response.close()
+        return false, "OpenAI TTS HTTP " .. tostring(code) .. ": " .. tostring(errBody):sub(1, 240)
+    end
+
+    local ok, err = pcall(function()
+        local chunks = 0
+        local bytes = 0
+        local carryByte = nil
+
+        while true do
+            local raw = response.read(OPENAI_TTS_PCM_CHUNK_SIZE)
+            if not raw then break end
+
+            chunks = chunks + 1
+            bytes = bytes + #raw
+
+            if debug and chunks == 1 then
+                print("[TTS] First PCM chunk: " .. tostring(#raw) .. " bytes.")
+            end
+
+            local audio
+            audio, carryByte = pcm16leToSpeakerBuffer(raw, carryByte)
+
+            if #audio > 0 then
+                local played, playErr = playAudioBufferOnAll(audio, TTS_VOLUME, debug, nil)
+                if not played then
+                    error(playErr or "Speaker playback failed.")
+                end
+            end
+        end
+
+        if debug then
+            print("[TTS] PCM chunks: " .. tostring(chunks) .. " | Bytes: " .. tostring(bytes))
+        end
+
+        if chunks == 0 then
+            error("OpenAI TTS returned zero PCM chunks.")
+        end
+    end)
+
+    response.close()
+
+    if not ok then
+        return false, tostring(err)
+    end
+
+    return true, "spoken"
+end
+
+local function speakOneChunkLegacy(cleaned, debug, chunkIndex, chunkCount)
+    if debug then
+        print("[TTS] Legacy fallback chunk " .. tostring(chunkIndex) .. "/" .. tostring(chunkCount) .. " (" .. tostring(#cleaned) .. " chars).")
     end
 
     local ok, err = pcall(function()
         local dfpwm = require("cc.audio.dfpwm")
         local decoder = dfpwm.make_decoder()
 
-        local url = TTS_URL_BASE .. textutils.urlEncode(cleaned)
+        local url = LEGACY_TTS_URL_BASE .. textutils.urlEncode(cleaned)
         local response = http.get(url, {
-            ["User-Agent"] = "CC-Tweaked-JARVIS-TTS",
+            ["User-Agent"] = "CC-Tweaked-JARVIS-Legacy-TTS",
         }, true)
 
-        if not response then error("TTS HTTP request failed.") end
-
-        local code = "?"
-        if response.getResponseCode then
-            local okCode, c = pcall(function() return response.getResponseCode() end)
-            if okCode then code = tostring(c) end
-        end
-
-        if debug then print("[TTS] HTTP " .. tostring(code)) end
+        if not response then error("Legacy TTS HTTP request failed.") end
 
         local chunks = 0
         local bytes = 0
 
         while true do
-            local chunk = response.read(TTS_CHUNK_SIZE)
+            local chunk = response.read(LEGACY_TTS_CHUNK_SIZE)
             if not chunk then break end
 
             chunks = chunks + 1
             bytes = bytes + #chunk
 
             if debug and chunks == 1 then
-                print("[TTS] First audio chunk: " .. tostring(#chunk) .. " bytes.")
+                print("[TTS] Legacy first audio chunk: " .. tostring(#chunk) .. " bytes.")
             end
 
             local audio = decoder(chunk)
@@ -966,21 +1125,39 @@ local function speakOneChunkToCity(cleaned, debug, chunkIndex, chunkCount)
         response.close()
 
         if debug then
-            print("[TTS] Audio chunks: " .. tostring(chunks) .. " | Bytes: " .. tostring(bytes))
+            print("[TTS] Legacy chunks: " .. tostring(chunks) .. " | Bytes: " .. tostring(bytes))
         end
 
-        if chunks == 0 then error("TTS returned zero audio chunks.") end
+        if chunks == 0 then error("Legacy TTS returned zero audio chunks.") end
     end)
 
     if not ok then return false, tostring(err) end
     return true, "spoken"
 end
 
+local function speakOneChunkToCity(cleaned, debug, chunkIndex, chunkCount)
+    if TTS_PROVIDER == "openai" then
+        local ok, err = speakOneChunkOpenAI(cleaned, debug, chunkIndex, chunkCount)
+        if ok then return true, "spoken" end
+
+        if debug then print("[TTS] OpenAI failed: " .. tostring(err)) end
+
+        if LEGACY_TTS_FALLBACK_ENABLED then
+            if debug then print("[TTS] Trying legacy fallback.") end
+            return speakOneChunkLegacy(cleaned, debug, chunkIndex, chunkCount)
+        end
+
+        return false, err
+    end
+
+    return speakOneChunkLegacy(cleaned, debug, chunkIndex, chunkCount)
+end
+
 local function speakToCity(text, debug)
     if debug then print("[TTS] Requested.") end
 
     if not TTS_ENABLED then return false, "TTS disabled." end
-    if not http or not http.get then return false, "HTTP unavailable for TTS." end
+    if not http or not http.get or not http.post then return false, "HTTP unavailable for TTS." end
 
     scanSpeakers()
 
@@ -993,13 +1170,14 @@ local function speakToCity(text, debug)
     if debug then
         local total = 0
         for _, c in ipairs(chunks) do total = total + #c end
+        print("[TTS] Provider: " .. tostring(TTS_PROVIDER))
         print("[TTS] Split into " .. tostring(#chunks) .. " request(s), " .. tostring(total) .. " chars total.")
     end
 
     for i, chunk in ipairs(chunks) do
         local ok, err = speakOneChunkToCity(chunk, debug, i, #chunks)
         if not ok then return false, err end
-        if i < #chunks then sleep(0.15) end
+        if i < #chunks then sleep(0.12) end
     end
 
     return true, "spoken"
@@ -1015,7 +1193,7 @@ local function speakAsync(text)
                 if not ok then print("TTS warning: " .. tostring(err)) end
             end,
             function()
-                sleep(30)
+                sleep(45)
                 print("TTS timeout.")
             end
         )
@@ -1026,12 +1204,13 @@ local function ttsDebug()
     print("")
     line()
     print("TTS DEBUG")
-    print("HTTP API: " .. boolText(http and http.get))
-    print("DFPWM require: testing...")
-
-    local okDfpwm, dfpwmOrErr = pcall(function() return require("cc.audio.dfpwm") end)
-    print("DFPWM OK: " .. boolText(okDfpwm))
-    if not okDfpwm then print("DFPWM error: " .. tostring(dfpwmOrErr)) end
+    print("Provider: " .. tostring(TTS_PROVIDER))
+    print("OpenAI model: " .. tostring(OPENAI_TTS_MODEL))
+    print("OpenAI voice: " .. tostring(OPENAI_TTS_VOICE))
+    print("OpenAI format: " .. tostring(OPENAI_TTS_RESPONSE_FORMAT))
+    print("HTTP API: " .. boolText(http and http.get and http.post))
+    print("Legacy fallback: " .. boolText(LEGACY_TTS_FALLBACK_ENABLED))
+    print("")
 
     scanSpeakers()
     print("Speakers visible: " .. tostring(#citySpeakers))
@@ -1045,7 +1224,7 @@ local function ttsDebug()
     sleep(0.4)
 
     print("")
-    print("Speaking test line...")
+    print("Speaking OpenAI TTS test line...")
     local okSpeak, speakErr = speakToCity("JARVIS town broadcast voice online. Red and black banners stand ready under Ako.", true)
 
     if okSpeak then
@@ -1390,7 +1569,7 @@ local function bootScreen()
     print("Version: " .. VERSION)
     print("Model: " .. MODEL)
     print("")
-    print("Mode: GPT morning broadcast + TTS + integrated music")
+    print("Mode: GPT morning broadcast + OpenAI TTS + integrated music")
     print("Nation: " .. NATION_NAME)
     print("Leader: " .. LEADER_NAME)
     print("Colours: " .. STATE_COLOURS)
@@ -1414,6 +1593,8 @@ local function bootScreen()
     print("  tts off     - disable TTS")
     print("  tts test    - speak test line")
     print("  tts debug   - full TTS diagnostic")
+    print("  voice cedar - change OpenAI voice")
+    print("  voices      - list recommended voices")
     print("  tracks      - load/list approved music")
     print("  playmusic   - play random approved music")
     print("  stopmusic   - stop current music")
@@ -1483,6 +1664,27 @@ local function chatLoop()
 
             elseif lower == "tts debug" then
                 ttsDebug()
+
+            elseif lower == "voices" then
+                print("OpenAI voices to try:")
+                print("  cedar  - authoritative / polished")
+                print("  marin  - natural / high quality")
+                print("  onyx   - deep / serious")
+                print("  ballad - ceremonial / theatrical")
+                print("  verse  - expressive")
+                print("  coral  - warmer")
+                print("Current voice: " .. tostring(OPENAI_TTS_VOICE))
+
+            elseif lower:match("^voice%s+") then
+                local requested = trim(input:match("^%S+%s+(.+)$") or "")
+                if requested ~= "" then
+                    OPENAI_TTS_VOICE = requested
+                    print("OpenAI TTS voice set to: " .. OPENAI_TTS_VOICE)
+                    local okSpeak, speakErr = speakToCity("Voice changed. JARVIS public broadcast voice is now set to " .. OPENAI_TTS_VOICE .. ".", true)
+                    if not okSpeak then print("Voice test failed: " .. tostring(speakErr)) end
+                else
+                    print("Usage: voice cedar")
+                end
 
             elseif lower == "tracks" then
                 printTracks()
