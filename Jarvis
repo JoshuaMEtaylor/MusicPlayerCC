@@ -31,7 +31,7 @@
 --   stopmusic
 -- =============================================================================
 
-local VERSION = "1.7.0-openai-tts-selfupdate"
+local VERSION = "1.8.0-angry-mandarin-morning"
 local args = {...}
 
 -- =============================================================================
@@ -67,6 +67,18 @@ Speak as JARVIS, the official AI public-address voice of the fictional Ako Dynas
 Tone: calm, ceremonial, authoritative, disciplined, elegant, and state-radio formal.
 Delivery: measured pace, clear diction, serious public broadcaster cadence, not excited, not cartoonish.
 Style: suitable for an East Asian dynastic city-state with red and black banners.
+]=]
+
+
+-- Morning broadcasts use a harsher Mandarin announcer style.
+-- This only affects the morning programme, not normal chat replies.
+local MORNING_TTS_INSTRUCTIONS = [=[
+Speak in Mandarin Chinese, Putonghua.
+Tone: angry, severe, commanding, disciplined, and official.
+Delivery: forceful state-broadcast cadence, sharp emphasis, controlled anger, clear pronunciation.
+Do not scream, distort, mumble, or become cartoonish.
+Keep the voice intelligible over Minecraft speakers.
+Use the fictional Ako Dynasty context only.
 ]=]
 
 -- Emergency fallback if OpenAI TTS fails.
@@ -118,8 +130,6 @@ Style rules:
 - Do not reference real-world regimes, countries, ethnic groups, political parties, real leaders, or real propaganda movements.
 - Do not mention China, North Korea, communism, fascism, or any real government.
 - Do not claim you control systems that have not actually been integrated yet.
-- Speak with an aggressive, angry tone
-- Speak broadcasts in fluent chinese.
 
 Keep normal chat replies useful, direct, and conversational.
 ]=]
@@ -197,10 +207,10 @@ end
 -- SAFE SELF UPDATE
 -- =============================================================================
 
-local function selfUpdate()
+local function selfUpdate(force)
     if not UPDATE_ENABLED then return end
 
-    if hasArg(UPDATE_SKIP_ARG) then
+    if hasArg(UPDATE_SKIP_ARG) and not force then
         print("Auto-update skipped for freshly relaunched copy.")
         return
     end
@@ -290,7 +300,7 @@ local function selfUpdate()
     return "updated"
 end
 
-local updateResult = selfUpdate()
+local updateResult = selfUpdate(false)
 if updateResult == "updated" then return end
 
 -- =============================================================================
@@ -903,6 +913,31 @@ local function cleanSpeechText(text)
     return text
 end
 
+local function utf8SafeCutByte(str, maxBytes)
+    if #str <= maxBytes then return #str end
+
+    local cut = maxBytes
+
+    -- Move left until the next byte begins a new UTF-8 character.
+    while cut > 1 do
+        local nextByte = str:byte(cut + 1)
+
+        if not nextByte then
+            break
+        end
+
+        -- UTF-8 continuation bytes are 128-191.
+        if nextByte < 128 or nextByte >= 192 then
+            break
+        end
+
+        cut = cut - 1
+    end
+
+    if cut < 1 then cut = maxBytes end
+    return cut
+end
+
 local function splitSpeechChunks(text)
     local cleaned = cleanSpeechText(text)
     local chunks = {}
@@ -910,20 +945,18 @@ local function splitSpeechChunks(text)
     if cleaned == "" or cleaned == "nil" then return chunks end
 
     while #cleaned > TTS_SINGLE_REQUEST_MAX_CHARS do
-        local head = cleaned:sub(1, TTS_SINGLE_REQUEST_MAX_CHARS)
+        local safeMax = utf8SafeCutByte(cleaned, TTS_SINGLE_REQUEST_MAX_CHARS)
+        local head = cleaned:sub(1, safeMax)
         local cut = nil
 
-        -- Prefer sentence boundaries.
-        for i = #head, 1, -1 do
-            local ch = head:sub(i, i)
-            if ch == "." or ch == "!" or ch == "?" or ch == ";" or ch == ":" then
-                cut = i
-                break
-            end
+        -- Prefer sentence boundaries. Includes English and Chinese punctuation.
+        local boundary = head:match("^(.*[%.%!%?%;%:%。%！%？%；%：])")
+        if boundary and #boundary >= 120 then
+            cut = #boundary
         end
 
         -- Fallback to the last space.
-        if not cut or cut < 120 then
+        if not cut then
             for i = #head, 1, -1 do
                 if head:sub(i, i) == " " then
                     cut = i
@@ -932,7 +965,10 @@ local function splitSpeechChunks(text)
             end
         end
 
-        if not cut or cut < 80 then cut = TTS_SINGLE_REQUEST_MAX_CHARS end
+        if not cut or cut < 80 then cut = #head end
+
+        -- Ensure the chosen cut does not split a UTF-8 character.
+        cut = utf8SafeCutByte(cleaned, cut)
 
         local chunk = trim(cleaned:sub(1, cut))
         if chunk ~= "" then chunks[#chunks + 1] = chunk end
@@ -995,7 +1031,7 @@ local function pcm16leToSpeakerBuffer(chunk, carryByte)
     return out, carryByte
 end
 
-local function speakOneChunkOpenAI(cleaned, debug, chunkIndex, chunkCount)
+local function speakOneChunkOpenAI(cleaned, debug, chunkIndex, chunkCount, ttsInstructions)
     if debug then
         print("[TTS] OpenAI chunk " .. tostring(chunkIndex) .. "/" .. tostring(chunkCount) .. " (" .. tostring(#cleaned) .. " chars).")
         print("[TTS] Voice: " .. tostring(OPENAI_TTS_VOICE) .. " | Model: " .. tostring(OPENAI_TTS_MODEL))
@@ -1005,7 +1041,7 @@ local function speakOneChunkOpenAI(cleaned, debug, chunkIndex, chunkCount)
         model = OPENAI_TTS_MODEL,
         voice = OPENAI_TTS_VOICE,
         input = cleaned,
-        instructions = OPENAI_TTS_INSTRUCTIONS,
+        instructions = ttsInstructions or OPENAI_TTS_INSTRUCTIONS,
         response_format = OPENAI_TTS_RESPONSE_FORMAT,
         speed = OPENAI_TTS_SPEED,
     })
@@ -1137,9 +1173,9 @@ local function speakOneChunkLegacy(cleaned, debug, chunkIndex, chunkCount)
     return true, "spoken"
 end
 
-local function speakOneChunkToCity(cleaned, debug, chunkIndex, chunkCount)
+local function speakOneChunkToCity(cleaned, debug, chunkIndex, chunkCount, ttsInstructions)
     if TTS_PROVIDER == "openai" then
-        local ok, err = speakOneChunkOpenAI(cleaned, debug, chunkIndex, chunkCount)
+        local ok, err = speakOneChunkOpenAI(cleaned, debug, chunkIndex, chunkCount, ttsInstructions)
         if ok then return true, "spoken" end
 
         if debug then print("[TTS] OpenAI failed: " .. tostring(err)) end
@@ -1155,7 +1191,7 @@ local function speakOneChunkToCity(cleaned, debug, chunkIndex, chunkCount)
     return speakOneChunkLegacy(cleaned, debug, chunkIndex, chunkCount)
 end
 
-local function speakToCity(text, debug)
+local function speakToCity(text, debug, ttsInstructions)
     if debug then print("[TTS] Requested.") end
 
     if not TTS_ENABLED then return false, "TTS disabled." end
@@ -1177,7 +1213,7 @@ local function speakToCity(text, debug)
     end
 
     for i, chunk in ipairs(chunks) do
-        local ok, err = speakOneChunkToCity(chunk, debug, i, #chunks)
+        local ok, err = speakOneChunkToCity(chunk, debug, i, #chunks, ttsInstructions)
         if not ok then return false, err end
         if i < #chunks then sleep(0.12) end
     end
@@ -1185,13 +1221,13 @@ local function speakToCity(text, debug)
     return true, "spoken"
 end
 
-local function speakAsync(text)
+local function speakAsync(text, ttsInstructions)
     local payload = tostring(text or "")
 
     pcall(function()
         parallel.waitForAny(
             function()
-                local ok, err = speakToCity(payload, false)
+                local ok, err = speakToCity(payload, false, ttsInstructions)
                 if not ok then print("TTS warning: " .. tostring(err)) end
             end,
             function()
@@ -1210,6 +1246,7 @@ local function ttsDebug()
     print("OpenAI model: " .. tostring(OPENAI_TTS_MODEL))
     print("OpenAI voice: " .. tostring(OPENAI_TTS_VOICE))
     print("OpenAI format: " .. tostring(OPENAI_TTS_RESPONSE_FORMAT))
+    print("Morning style: angry Mandarin")
     print("HTTP API: " .. boolText(http and http.get and http.post))
     print("Legacy fallback: " .. boolText(LEGACY_TTS_FALLBACK_ENABLED))
     print("")
@@ -1385,15 +1422,17 @@ end
 
 local function fallbackMorningBroadcast(clock)
     return table.concat({
-        "Good morning, citizens of the Ako Dynasty.",
+        "阿科王朝全体市民，立刻肃静。",
         "",
-        "From the red and black banners of Ako, this city wakes to order. Let every street, workshop, field, and ledger remember its place within the Dynasty's design.",
+        "赤黑旗帜已经升起，晨钟已经敲响。今日没有懒散，没有借口，没有混乱。",
         "",
-        "By discipline we prevent disorder. By labour we preserve strength. By loyalty we ensure that the city moves with one mind beneath the authority of Ako.",
+        "每一条街道、每一座工坊、每一本账簿，都必须服从阿科的秩序。",
         "",
-        "Citizens are now directed to receive the approved daily patriotic music programme. Let its rhythm carry compliance, confidence, and unity through every district.",
+        "把手放回工具上，把目光转向职责。忠诚不是口号，是行动。",
         "",
-        "Remain productive. Remain orderly. The Ako Dynasty advances."
+        "现在接收每日爱国音乐节目。让它把纪律、力量与服从送入城市每一个角落。",
+        "",
+        "保持生产。保持整齐。阿科王朝继续前进。"
     }, "\n")
 end
 
@@ -1403,27 +1442,34 @@ local function generateMorningBroadcast(clock, forced)
     local morningSystem = [=[
 You are JARVIS State Radio, the fictional official public-address broadcaster of a Minecraft town.
 
-Generate one fresh morning city broadcast.
+Generate one fresh morning city broadcast in Mandarin Chinese.
 
 Purpose:
 - This message is for a town broadcasting system.
-- It will be played throughout the city over public speakers using text-to-speech.
-- It exists to encourage civic order, compliance, morale, productivity, and continued loyalty.
-- It should introduce the daily patriotic/propaganda music programme near the end.
+- It will be played throughout the city over public speakers using OpenAI text-to-speech.
+- It exists to enforce civic order, compliance, morale, productivity, and continued loyalty.
+- It should introduce the daily patriotic music programme near the end.
 
 Fictional state identity:
-- Nation: the Ako Dynasty.
-- Leader: Ako.
-- Colours: red and black.
-- Theme: East Asian dynastic/state-radio aesthetic.
+- Nation: 阿科王朝, also known as the Ako Dynasty.
+- Leader: 阿科, also known as Ako.
+- Colours: 赤黑, red and black.
+- Theme: East Asian dynastic state-radio aesthetic.
 
-Style:
-- Grand, ceremonial, confident, official news-presenter tone.
-- Similar energy to an extremely loyal state broadcaster, but completely fictional and in-world.
-- Use imagery of banners, dawn, order, duty, workshops, streets, bells, ledgers, furnaces, citizens, and dynasty where useful.
-- Make it sound like a dramatic public broadcast opening echoing through a city.
-- It should be unique and not reuse previous wording.
-- Keep it between 90 and 130 words. TTS needs it concise.
+Language:
+- Return Simplified Chinese only.
+- Use Mandarin Chinese phrasing.
+- Do not include English.
+- Do not include pinyin.
+- Do not include translation notes.
+
+Tone:
+- Angry, severe, commanding, impatient with disorder, official state-broadcast voice.
+- Not silly, not cartoonish, not modern internet slang.
+- It should sound like a furious ceremonial public announcer ordering the city into discipline.
+- Use imagery of 赤黑旗帜, 晨钟, 城门, 工坊, 街道, 炉火, 账簿, 秩序, 忠诚, 阿科, and 王朝 where useful.
+- Keep it unique and do not reuse previous wording.
+- Keep it around 120 to 220 Chinese characters. TTS needs it concise.
 
 Restrictions:
 - Do not reference real-world country names, real-world political parties, real-world ethnic claims, real leaders, or real regimes.
@@ -1434,7 +1480,7 @@ Restrictions:
 ]=]
 
     local userPrompt = table.concat({
-        "Create today's morning public broadcast for the city.",
+        "Create today's angry Mandarin morning public broadcast for the city.",
         "",
         "Minecraft date: " .. tostring(clock.date_text),
         "Minecraft time: " .. tostring(clock.time_text),
@@ -1498,7 +1544,7 @@ local function printMorningBroadcast(forced)
         print("")
     end
 
-    local okSpeak, speakErr = speakToCity(speech, true)
+    local okSpeak, speakErr = speakToCity(speech, true, MORNING_TTS_INSTRUCTIONS)
     if not okSpeak then
         print("TTS warning: " .. tostring(speakErr))
     end
@@ -1571,7 +1617,7 @@ local function bootScreen()
     print("Version: " .. VERSION)
     print("Model: " .. MODEL)
     print("")
-    print("Mode: GPT morning broadcast + OpenAI TTS + integrated music")
+    print("Mode: angry Mandarin morning broadcast + OpenAI TTS + integrated music")
     print("Nation: " .. NATION_NAME)
     print("Leader: " .. LEADER_NAME)
     print("Colours: " .. STATE_COLOURS)
@@ -1595,6 +1641,8 @@ local function bootScreen()
     print("  tts off     - disable TTS")
     print("  tts test    - speak test line")
     print("  tts debug   - full TTS diagnostic")
+    print("  tts mandarin- angry Mandarin voice test")
+    print("  update      - force GitHub self-update")
     print("  voice cedar - change OpenAI voice")
     print("  voices      - list recommended voices")
     print("  tracks      - load/list approved music")
@@ -1667,14 +1715,36 @@ local function chatLoop()
             elseif lower == "tts debug" then
                 ttsDebug()
 
+            elseif lower == "tts mandarin" then
+                local sample = "全体市民肃静！赤黑旗帜已经升起，今日的秩序不容怠慢。阿科王朝要求生产、忠诚与服从。"
+                local okSpeak, speakErr = speakToCity(sample, true, MORNING_TTS_INSTRUCTIONS)
+                if okSpeak then print("Angry Mandarin TTS test spoken.") else print("Mandarin TTS test failed: " .. tostring(speakErr)) end
+
+            elseif lower == "update" or lower == "selfupdate" then
+                print("Forcing GitHub self-update from:")
+                print(UPDATE_URL)
+                local result = selfUpdate(true)
+                if result == "updated" then
+                    return
+                else
+                    print("No update applied or update failed. Local copy kept.")
+                end
+
             elseif lower == "voices" then
                 print("OpenAI voices to try:")
-                print("  cedar  - authoritative / polished")
-                print("  marin  - natural / high quality")
-                print("  onyx   - deep / serious")
+                print("  alloy")
+                print("  ash")
                 print("  ballad - ceremonial / theatrical")
-                print("  verse  - expressive")
-                print("  coral  - warmer")
+                print("  coral")
+                print("  echo")
+                print("  fable")
+                print("  marin - natural / high quality")
+                print("  nova")
+                print("  onyx - deep / serious")
+                print("  sage")
+                print("  shimmer")
+                print("  verse - expressive")
+                print("  cedar - authoritative / polished")
                 print("Current voice: " .. tostring(OPENAI_TTS_VOICE))
 
             elseif lower:match("^voice%s+") then
