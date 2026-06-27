@@ -31,7 +31,7 @@
 --   stopmusic
 -- =============================================================================
 
-local VERSION = "4.2.0-hybrid-pa-controller"
+local VERSION = "4.2.1-hybrid-pa-controller-hastype-fix"
 local args = {...}
 
 -- =============================================================================
@@ -232,24 +232,46 @@ local function forceMonitorFit(mon)
 end
 
 local function periphHasType(name, wanted)
+    if not peripheral or not peripheral.getType then
+        return false
+    end
+
+    -- Compatibility: older CC builds/modpacks may not have peripheral.hasType.
     if peripheral.hasType then
         local ok, result = pcall(function()
             return peripheral.hasType(name, wanted)
         end)
-        if ok and result then return true end
+
+        if ok and result then
+            return true
+        end
     end
 
-    local pType = peripheral.getType(name)
+    local okType, pType = pcall(function()
+        return peripheral.getType(name)
+    end)
 
-    if pType == wanted then return true end
+    if not okType then
+        return false
+    end
+
+    if pType == wanted then
+        return true
+    end
 
     if type(pType) == "table" then
         for _, t in ipairs(pType) do
-            if t == wanted then return true end
+            if t == wanted then
+                return true
+            end
         end
     end
 
     return false
+end
+
+local function peripheralHasType(name, wanted)
+    return periphHasType(name, wanted)
 end
 
 local function mirrorScanMonitors()
@@ -663,7 +685,7 @@ local function peripheralIsSpeaker(name)
 
     if peripheral.hasType then
         local ok, result = pcall(function()
-            return peripheral.hasType(name, "speaker")
+            return peripheralHasType(name, "speaker")
         end)
         if ok and result == true then return true end
     end
