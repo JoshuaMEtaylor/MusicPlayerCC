@@ -31,7 +31,7 @@
 --   stopmusic
 -- =============================================================================
 
-local VERSION = "3.1.0-pass-fail-speaker-report"
+local VERSION = "3.3.0-monitor-passfail-restored"
 local args = {...}
 
 -- =============================================================================
@@ -205,7 +205,6 @@ local nativeWrite = write
 
 local mirrorMonitors = {}
 local mirrorStarted = false
-local mirrorLineBuffers = {}
 
 local function periphHasType(name, wanted)
     if peripheral.hasType then
@@ -216,6 +215,7 @@ local function periphHasType(name, wanted)
     end
 
     local pType = peripheral.getType(name)
+
     if pType == wanted then return true end
 
     if type(pType) == "table" then
@@ -253,8 +253,6 @@ local function mirrorScanMonitors()
                     width = tonumber(w) or 0,
                     height = tonumber(h) or 0,
                 }
-
-                mirrorLineBuffers[tostring(name)] = ""
             end
         end
     end
@@ -277,59 +275,63 @@ local function mirrorScrollIfNeeded(item)
     end
 end
 
-local function mirrorWriteRaw(textValue)
+local function mirrorWriteRaw(value)
     if not mirrorStarted or #mirrorMonitors == 0 then
         return
     end
 
-    local textOut = tostring(textValue or "")
+    local textValue = tostring(value or "")
 
     for _, item in ipairs(mirrorMonitors) do
         pcall(function()
             local mon = item.monitor
             local w, h = mon.getSize()
 
-            for part, newline in textOut:gmatch("([^\n]*)(\n?)") do
-                if part ~= "" then
-                    mirrorScrollIfNeeded(item)
+            local i = 1
+            while i <= #textValue do
+                local ch = textValue:sub(i, i)
 
-                    local x, y = mon.getCursorPos()
-                    local remaining = part
-
-                    while #remaining > 0 do
-                        mirrorScrollIfNeeded(item)
-                        x, y = mon.getCursorPos()
-
-                        local space = w - x + 1
-
-                        if space <= 0 then
-                            mon.setCursorPos(1, y + 1)
-                            mirrorScrollIfNeeded(item)
-                            x, y = mon.getCursorPos()
-                            space = w
-                        end
-
-                        local chunk = remaining:sub(1, space)
-                        mon.write(chunk)
-                        remaining = remaining:sub(space + 1)
-
-                        x, y = mon.getCursorPos()
-                        mon.setCursorPos(x + #chunk, y)
-                    end
-                end
-
-                if newline == "\n" then
+                if ch == "\n" then
                     local x, y = mon.getCursorPos()
                     mon.setCursorPos(1, y + 1)
                     mirrorScrollIfNeeded(item)
+                else
+                    mirrorScrollIfNeeded(item)
+
+                    local x, y = mon.getCursorPos()
+
+                    if x > w then
+                        mon.setCursorPos(1, y + 1)
+                        mirrorScrollIfNeeded(item)
+                        x, y = mon.getCursorPos()
+                    end
+
+                    mon.write(ch)
+                    mon.setCursorPos(x + 1, y)
                 end
 
-                if newline == "" then
-                    break
-                end
+                i = i + 1
             end
         end)
     end
+end
+
+print = function(...)
+    nativePrint(...)
+
+    local parts = {}
+    local argc = select("#", ...)
+
+    for i = 1, argc do
+        parts[#parts + 1] = tostring(select(i, ...))
+    end
+
+    mirrorWriteRaw(table.concat(parts, "\t") .. "\n")
+end
+
+write = function(value)
+    nativeWrite(value)
+    mirrorWriteRaw(tostring(value or ""))
 end
 
 local function startMonitorMirror()
@@ -356,7 +358,6 @@ local function monitorMirrorTest()
     refreshMonitorMirror()
     print("MONITOR TEST: If you can read this on the large monitor, mirroring is working.")
 end
-
 
 local function encodePath(path)
     return tostring(path):gsub("([^%w%-%._~/])", function(c)
