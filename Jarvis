@@ -31,7 +31,7 @@
 --   stopmusic
 -- =============================================================================
 
-local VERSION = "4.6.0-command-pa-controller"
+local VERSION = "4.7.0-command-pa-controller-voice-sync"
 local args = {...}
 
 -- =============================================================================
@@ -966,13 +966,23 @@ local function nodeMusic(track)
     }, PA_NODE_ACK_TIMEOUT, true)
 end
 
-local function nodeProgram(ttsText, track, language)
+local function nodeProgram(ttsText, track, language, ttsInstructions)
+    local instructions = ttsInstructions or OPENAI_TTS_INSTRUCTIONS
+
+    if language == "mandarin_morning" then
+        instructions = ttsInstructions or MORNING_TTS_INSTRUCTIONS
+    end
+
     if not track then
         return sendNodeCommand({
             type = "speak",
             text = tostring(ttsText or ""),
             volume = TTS_VOLUME,
             language = language or "normal",
+            voice = OPENAI_TTS_VOICE,
+            tts_provider = TTS_PROVIDER,
+            tts_model = OPENAI_TTS_MODEL,
+            tts_instructions = instructions,
         }, PA_NODE_ACK_TIMEOUT, true)
     end
 
@@ -980,6 +990,10 @@ local function nodeProgram(ttsText, track, language)
         type = "program",
         tts_text = tostring(ttsText or ""),
         language = language or "normal",
+        voice = OPENAI_TTS_VOICE,
+        tts_provider = TTS_PROVIDER,
+        tts_model = OPENAI_TTS_MODEL,
+        tts_instructions = instructions,
         tts_volume = TTS_VOLUME,
         music_url = tostring(track.url or ""),
         music_name = tostring(track.name or "track"),
@@ -2529,7 +2543,7 @@ local function printMorningBroadcast(forced)
     local morningTrack = pickRandomMusicTrack()
 
     print("[NODE] Sending one programme command to wireless speaker nodes: TTS then music.")
-    nodeProgram(speech, morningTrack, "mandarin_morning")
+    nodeProgram(speech, morningTrack, "mandarin_morning", MORNING_TTS_INSTRUCTIONS)
     sleep(PA_NODE_PRESTART_DELAY)
 
     local okSpeak, speakErr = speakToCity(speech, false, MORNING_TTS_INSTRUCTIONS)
@@ -2746,7 +2760,7 @@ local function chatLoop()
                 print("Morning broadcast language: angry Mandarin only")
                 print("TTS provider: " .. tostring(TTS_PROVIDER))
                 print("OpenAI TTS voice: " .. tostring(OPENAI_TTS_VOICE))
-                print("Speaker audio mode: command-based PA nodes + direct wired speakers")
+                print("Speaker audio mode: command-based PA nodes + direct wired speakers; voice synced by node TTS")
 
             elseif lower == "update" or lower == "selfupdate" then
                 print("Forcing GitHub self-update from:")
