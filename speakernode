@@ -1,59 +1,42 @@
--- JARVIS Smart Command Speaker Node
--- Version: 3.1.0-command-node-openai-tts
+-- JARVIS Command Speaker Node
+-- Version: 3.0.0-command-program-node
 --
--- This node is an extension of JARVIS for local speakers.
+-- Sensible node model:
+--   JARVIS sends one command:
+--      play this TTS text, then play this music URL.
 --
--- It receives a high-level command from the main JARVIS computer:
---   1. Say this TTS text using this voice/instructions.
---   2. Then play this music URL.
---
--- Cost control:
---   - This node does NOT call GPT/chat/completions/responses.
---   - It only calls OpenAI TTS if JarvisKey.lua exists on this node.
---   - One node = one extra TTS request per broadcast it plays.
---   - If there is no JarvisKey.lua, it falls back to the free legacy TTS voice,
---     which will NOT match the OpenAI voice.
---
--- Music:
---   - Music is fetched from the URL JARVIS sends.
---   - No API key is used for music.
+-- The node does not use OpenAI, JarvisKey, or audio packet streams.
+-- It only uses HTTP to fetch the public TTS/music audio it was told to play.
 
-local VERSION = "3.1.0-command-node-openai-tts"
+local VERSION = "3.0.1-command-program-node-gpt-tts-only"
 local PROTOCOL = "JARVIS_PA_V1"
 
 local NODE_LABEL = os.getComputerLabel() or ("SpeakerNode-" .. tostring(os.getComputerID()))
 
-local KEY_FILE = "JarvisKey.lua"
-
-local DEFAULT_TTS_PROVIDER = "openai" -- "openai" or "legacy"
-local DEFAULT_OPENAI_TTS_MODEL = "gpt-4o-mini-tts"
-local DEFAULT_OPENAI_TTS_VOICE = "cedar"
-local OPENAI_TTS_RESPONSE_FORMAT = "pcm"
-local OPENAI_TTS_PCM_CHUNK_SIZE = 65536
-
 local TTS_VOLUME = 1.0
 local MUSIC_VOLUME = 1.0
-local MUSIC_CHUNK_SIZE = 16 * 1024
-local LEGACY_TTS_CHUNK_SIZE = 16 * 1024
+local AUDIO_CHUNK_SIZE = 16 * 1024
 
+-- GPT/OpenAI TTS only. No GPT/chat calls are made by this node.
+-- The main JARVIS still generates the text and picks the music.
+-- This node only turns the already-supplied text into audio using the same voice
+-- when JarvisKey.lua is present.
+local KEY_FILE = "JarvisKey.lua"
+local OPENAI_TTS_MODEL = "gpt-4o-mini-tts"
+local OPENAI_TTS_VOICE = "cedar"
+local OPENAI_TTS_RESPONSE_FORMAT = "pcm"
+local OPENAI_TTS_PCM_CHUNK_SIZE = 65536
 local OPENAI_TTS_INSTRUCTIONS = [=[
 Speak clearly and naturally over a Minecraft public-address speaker.
-Use a firm, official JARVIS announcer style.
+Use the same official JARVIS announcer style as the main terminal.
 Keep the voice intelligible and avoid mumbling or distortion.
 ]=]
 
-local MORNING_TTS_INSTRUCTIONS = [=[
-Speak in Mandarin Chinese, Putonghua.
-Tone: angry, severe, commanding, official, disciplined, and impatient with disorder.
-Delivery: forceful public-address cadence, sharp emphasis, clear pronunciation.
-Do not scream, distort, mumble, or become cartoonish.
-Keep the voice intelligible over Minecraft speakers.
-]=]
+local API_KEY = nil
 
 local localSpeakers = {}
 local currentJob = nil
 local cancelToken = 0
-local API_KEY = nil
 
 -- =============================================================================
 -- HELPERS
@@ -123,32 +106,6 @@ local function peripheralHasType(name, wanted)
     end
 
     return false
-end
-
-local function splitSpeechChunks(text, maxLen)
-    text = trim(text or "")
-    maxLen = maxLen or 700
-
-    local chunks = {}
-
-    while #text > maxLen do
-        local head = text:sub(1, maxLen)
-        local cut = head:match("^(.*[%.%!%?%;%:%。%！%？%；%：])")
-
-        if cut and #cut > 80 then
-            chunks[#chunks + 1] = trim(cut)
-            text = trim(text:sub(#cut + 1))
-        else
-            chunks[#chunks + 1] = trim(head)
-            text = trim(text:sub(maxLen + 1))
-        end
-    end
-
-    if text ~= "" then
-        chunks[#chunks + 1] = text
-    end
-
-    return chunks
 end
 
 local function openAllModems()
@@ -323,8 +280,12 @@ local function ack(to, commandId, ok, status, extra)
 end
 
 -- =============================================================================
--- API KEY / TTS AUDIO
+-- AUDIO PLAYERS
 -- =============================================================================
+
+local function shouldContinue(token)
+    return token == cancelToken
+end
 
 local function loadKey()
     local ok, result = pcall(function()
@@ -375,11 +336,33 @@ local function pcm16leToSpeakerBuffer(chunk)
     return out
 end
 
-local function shouldContinue(token)
-    return token == cancelToken
+local function splitSpeechChunks(text, maxLen)
+    text = trim(text or "")
+    maxLen = maxLen or 700
+
+    local chunks = {}
+
+    while #text > maxLen do
+        local head = text:sub(1, maxLen)
+        local cut = head:match("^(.*[%.%!%?%;%:%。%！%？%；%：])")
+
+        if cut and #cut > 80 then
+            chunks[#chunks + 1] = trim(cut)
+            text = trim(text:sub(#cut + 1))
+        else
+            chunks[#chunks + 1] = trim(head)
+            text = trim(text:sub(maxLen + 1))
+        end
+    end
+
+    if text ~= "" then
+        chunks[#chunks + 1] = text
+    end
+
+    return chunks
 end
 
-local function speakOpenAI(text, voice, model, instructions, volume, token)
+local function speakOpenAIChunk(text, voice, model, instructions, volume, token)
     if not API_KEY then
         return false, "OpenAI key missing on node."
     end
@@ -389,18 +372,20 @@ local function speakOpenAI(text, voice, model, instructions, volume, token)
     end
 
     local payload = textutils.serializeJSON({
-        model = model or DEFAULT_OPENAI_TTS_MODEL,
-        voice = voice or DEFAULT_OPENAI_TTS_VOICE,
+        model = model or OPENAI_TTS_MODEL,
+        voice = voice or OPENAI_TTS_VOICE,
         input = text,
         instructions = instructions or OPENAI_TTS_INSTRUCTIONS,
         response_format = OPENAI_TTS_RESPONSE_FORMAT,
     })
 
-    print("[NODE] OpenAI TTS: voice=" .. tostring(voice or DEFAULT_OPENAI_TTS_VOICE))
+    print("[NODE] GPT TTS voice=" .. tostring(voice or OPENAI_TTS_VOICE))
 
     local response = http.post("https://api.openai.com/v1/audio/speech", payload, {
         ["Content-Type"] = "application/json",
         ["Authorization"] = "Bearer " .. API_KEY,
+        ["Accept"] = "audio/pcm",
+        ["User-Agent"] = "CC-JARVIS-SpeakerNode",
     }, true)
 
     if not response then
@@ -429,8 +414,9 @@ local function speakOpenAI(text, voice, model, instructions, volume, token)
         return false, "cancelled"
     end
 
-    return true, "OpenAI TTS played"
+    return true, "GPT TTS played"
 end
+
 
 local function streamDfpwmUrl(url, volume, token, label)
     url = trim(url or "")
@@ -456,7 +442,7 @@ local function streamDfpwmUrl(url, volume, token, label)
     local chunks = 0
 
     while shouldContinue(token) do
-        local chunk = response.read(MUSIC_CHUNK_SIZE)
+        local chunk = response.read(AUDIO_CHUNK_SIZE)
         if not chunk then break end
 
         chunks = chunks + 1
@@ -479,45 +465,32 @@ local function streamDfpwmUrl(url, volume, token, label)
     return true, "played"
 end
 
-local function speakLegacy(text, volume, token)
-    local url = "https://music.madefor.cc/tts?text=" .. urlEncode(text)
-    return streamDfpwmUrl(url, volume or TTS_VOLUME, token, "legacy TTS")
-end
-
-local function playTtsText(text, provider, voice, model, instructions, volume, token)
+local function playTtsText(text, volume, token, voice, model, instructions)
     text = trim(text or "")
 
     if text == "" then
         return true, "no TTS text"
     end
 
+    if not API_KEY then
+        return false, "OpenAI key missing on node. Add JarvisKey.lua or run reloadkey."
+    end
+
     local chunks = splitSpeechChunks(text, 700)
 
-    for i, chunk in ipairs(chunks) do
+    for _, chunk in ipairs(chunks) do
         if not shouldContinue(token) then
             return false, "cancelled"
         end
 
-        local ok, err
-
-        if provider == "legacy" then
-            ok, err = speakLegacy(chunk, volume, token)
-        else
-            ok, err = speakOpenAI(chunk, voice, model, instructions, volume, token)
-
-            if not ok then
-                print("[NODE] OpenAI TTS failed: " .. tostring(err))
-                print("[NODE] Falling back to legacy TTS.")
-                ok, err = speakLegacy(chunk, volume, token)
-            end
-        end
+        local ok, err = speakOpenAIChunk(chunk, voice or OPENAI_TTS_VOICE, model or OPENAI_TTS_MODEL, instructions or OPENAI_TTS_INSTRUCTIONS, volume or TTS_VOLUME, token)
 
         if not ok then
             return false, err
         end
     end
 
-    return true, "TTS played"
+    return true, "GPT TTS played"
 end
 
 local function playMusicUrl(url, name, volume, token)
@@ -563,13 +536,12 @@ local function listenerLoop()
                     sender = sender,
                     command_id = msg.command_id,
                     tts_text = tostring(msg.tts_text or msg.text or ""),
-                    tts_provider = tostring(msg.tts_provider or DEFAULT_TTS_PROVIDER),
-                    voice = tostring(msg.voice or DEFAULT_OPENAI_TTS_VOICE),
-                    tts_model = tostring(msg.tts_model or DEFAULT_OPENAI_TTS_MODEL),
-                    tts_instructions = tostring(msg.tts_instructions or OPENAI_TTS_INSTRUCTIONS),
                     music_url = tostring(msg.music_url or msg.url or ""),
                     music_name = tostring(msg.music_name or msg.name or "track"),
                     tts_volume = msg.tts_volume or TTS_VOLUME,
+                    tts_voice = tostring(msg.voice or msg.tts_voice or OPENAI_TTS_VOICE),
+                    tts_model = tostring(msg.tts_model or OPENAI_TTS_MODEL),
+                    tts_instructions = tostring(msg.tts_instructions or OPENAI_TTS_INSTRUCTIONS),
                     music_volume = msg.music_volume or MUSIC_VOLUME,
                 })
 
@@ -581,11 +553,10 @@ local function listenerLoop()
                     sender = sender,
                     command_id = msg.command_id,
                     text = tostring(msg.text or ""),
-                    tts_provider = tostring(msg.tts_provider or DEFAULT_TTS_PROVIDER),
-                    voice = tostring(msg.voice or DEFAULT_OPENAI_TTS_VOICE),
-                    tts_model = tostring(msg.tts_model or DEFAULT_OPENAI_TTS_MODEL),
-                    tts_instructions = tostring(msg.tts_instructions or OPENAI_TTS_INSTRUCTIONS),
                     volume = msg.volume or TTS_VOLUME,
+                    tts_voice = tostring(msg.voice or msg.tts_voice or OPENAI_TTS_VOICE),
+                    tts_model = tostring(msg.tts_model or OPENAI_TTS_MODEL),
+                    tts_instructions = tostring(msg.tts_instructions or OPENAI_TTS_INSTRUCTIONS),
                 })
 
                 ack(sender, msg.command_id, true, "speak queued")
@@ -623,8 +594,7 @@ local function workerLoop()
 
             if job.type == "program" then
                 print("[NODE] Program from " .. tostring(job.sender) .. ": TTS then music.")
-                print("[NODE] TTS provider=" .. tostring(job.tts_provider) .. " voice=" .. tostring(job.voice))
-                ok, result = playTtsText(job.tts_text, job.tts_provider, job.voice, job.tts_model, job.tts_instructions, job.tts_volume, job.token)
+                ok, result = playTtsText(job.tts_text, job.tts_volume, job.token, job.tts_voice, job.tts_model, job.tts_instructions)
 
                 if ok and shouldContinue(job.token) then
                     ok, result = playMusicUrl(job.music_url, job.music_name, job.music_volume, job.token)
@@ -632,8 +602,7 @@ local function workerLoop()
 
             elseif job.type == "speak" then
                 print("[NODE] Speak from " .. tostring(job.sender))
-                print("[NODE] TTS provider=" .. tostring(job.tts_provider) .. " voice=" .. tostring(job.voice))
-                ok, result = playTtsText(job.text, job.tts_provider, job.voice, job.tts_model, job.tts_instructions, job.volume, job.token)
+                ok, result = playTtsText(job.text, job.volume, job.token, job.tts_voice, job.tts_model, job.tts_instructions)
 
             elseif job.type == "music" then
                 print("[NODE] Music from " .. tostring(job.sender) .. ": " .. tostring(job.name))
@@ -659,10 +628,9 @@ local function commandLoop()
             print("ID: " .. tostring(os.getComputerID()))
             print("Version: " .. VERSION)
             print("Protocol: " .. PROTOCOL)
-            print("HTTP: " .. boolText(http and http.get))
+            print("HTTP for public audio URLs: " .. boolText(http and http.get))
             print("OpenAI key: " .. boolText(API_KEY ~= nil))
-            print("Default provider: " .. DEFAULT_TTS_PROVIDER)
-            print("Default voice: " .. DEFAULT_OPENAI_TTS_VOICE)
+            print("OpenAI voice default: " .. OPENAI_TTS_VOICE)
             print("Speakers: " .. tostring(#localSpeakers))
             for i, item in ipairs(localSpeakers) do
                 print("  " .. tostring(i) .. ". " .. tostring(item.name))
@@ -704,15 +672,15 @@ scanSpeakers()
 API_KEY = loadKey()
 
 print("")
-print("JARVIS SMART COMMAND SPEAKER NODE")
+print("JARVIS COMMAND SPEAKER NODE")
 print("Version: " .. VERSION)
 print("Computer ID: " .. tostring(os.getComputerID()))
 print("Label: " .. tostring(NODE_LABEL))
 print("Protocol: " .. PROTOCOL)
-print("Role: receive JARVIS command, use same voice/instructions, then play music")
+print("Role: receive command, play GPT TTS, then play music")
+print("HTTP: used for OpenAI TTS and public music URLs")
 print("OpenAI key: " .. boolText(API_KEY ~= nil))
-print("Cost note: no GPT calls; OpenAI TTS only if key is present.")
-print("Music: fetched from JARVIS-selected URL")
+print("GPT note: no chat/GPT prompt calls, only TTS audio.")
 print("Local speakers: " .. tostring(#localSpeakers))
 for i, item in ipairs(localSpeakers) do
     print("  " .. tostring(i) .. ". " .. tostring(item.name))
