@@ -8,7 +8,7 @@
 -- The node does not use OpenAI, JarvisKey, or audio packet streams.
 -- It only uses HTTP to fetch the public TTS/music audio it was told to play.
 
-local VERSION = "3.0.1-command-program-node-gpt-tts-only"
+local VERSION = "3.0.5-command-node-gpt-tts-minimal-fix"
 local PROTOCOL = "JARVIS_PA_V1"
 
 local NODE_LABEL = os.getComputerLabel() or ("SpeakerNode-" .. tostring(os.getComputerID()))
@@ -17,21 +17,19 @@ local TTS_VOLUME = 1.0
 local MUSIC_VOLUME = 1.0
 local AUDIO_CHUNK_SIZE = 16 * 1024
 
--- GPT/OpenAI TTS only. No GPT/chat calls are made by this node.
--- The main JARVIS still generates the text and picks the music.
--- This node only turns the already-supplied text into audio using the same voice
--- when JarvisKey.lua is present.
+-- GPT/OpenAI TTS swap only.
+-- Main JARVIS still sends the text and music URL.
+-- This node keeps the working music path unchanged.
 local KEY_FILE = "JarvisKey.lua"
 local OPENAI_TTS_MODEL = "gpt-4o-mini-tts"
 local OPENAI_TTS_VOICE = "cedar"
 local OPENAI_TTS_RESPONSE_FORMAT = "pcm"
-local OPENAI_TTS_PCM_CHUNK_SIZE = 65536
-local OPENAI_TTS_INSTRUCTIONS = [=[
-Speak clearly and naturally over a Minecraft public-address speaker.
-Use the same official JARVIS announcer style as the main terminal.
-Keep the voice intelligible and avoid mumbling or distortion.
-]=]
+local OPENAI_TTS_PCM_CHUNK_SIZE = 8192
+local OPENAI_TTS_TEXT_CHUNK_MAX = 300
+local OPENAI_TTS_SPEED = 1.0
 
+-- OpenAI PCM is 24 kHz mono. CC speakers expect 48 kHz.
+-- Duplicate each sample once to keep the correct speed.
 local API_KEY = nil
 
 local localSpeakers = {}
@@ -313,32 +311,9 @@ local function loadKey()
     return nil
 end
 
-local function pcm16leToSpeakerBuffer(chunk)
-    local out = {}
-    local oi = 1
-
-    for i = 1, #chunk - 1, 2 do
-        local lo = chunk:byte(i)
-        local hi = chunk:byte(i + 1)
-
-        local sample = hi * 256 + lo
-        if sample >= 32768 then sample = sample - 65536 end
-
-        local v = math.floor(sample / 256)
-
-        if v > 127 then v = 127 end
-        if v < -128 then v = -128 end
-
-        out[oi] = v
-        oi = oi + 1
-    end
-
-    return out
-end
-
 local function splitSpeechChunks(text, maxLen)
     text = trim(text or "")
-    maxLen = maxLen or 700
+    maxLen = maxLen or OPENAI_TTS_TEXT_CHUNK_MAX
 
     local chunks = {}
 
@@ -346,7 +321,7 @@ local function splitSpeechChunks(text, maxLen)
         local head = text:sub(1, maxLen)
         local cut = head:match("^(.*[%.%!%?%;%:%。%！%？%；%：])")
 
-        if cut and #cut > 80 then
+        if cut and #cut > 60 then
             chunks[#chunks + 1] = trim(cut)
             text = trim(text:sub(#cut + 1))
         else
@@ -362,41 +337,126 @@ local function splitSpeechChunks(text, maxLen)
     return chunks
 end
 
-local function speakOpenAIChunk(text, voice, model, instructions, volume, token)
+local function pcm16leToSpeakerBuffer(chunk, carryByte)
+    local out = {}
+    local i = 1
+
+    if carryByte ~= nil then
+        if #chunk >= 1 then
+            local lo = carryByte
+            local hi = chunk:byte(1)
+            local sample16 = lo + hi * 256
+
+            if sample16 >= 32768 then
+                sample16 = sample16 - 65536
+            end
+
+            local v = math.floor(sample16 / 256)
+
+            if v > 127 then v = 127 end
+            if v < -128 then v = -128 end
+
+            out[#out + 1] = v
+            out[#out + 1] = v
+
+            carryByte = nil
+            i = 2
+        else
+            return out, carryByte
+        end
+    end
+
+    while i + 1 <= #chunk do
+        local lo = chunk:byte(i)
+        local hi = chunk:byte(i + 1)
+        local sample16 = lo + hi * 256
+
+        if sample16 >= 32768 then
+            sample16 = sample16 - 65536
+        end
+
+        local v = math.floor(sample16 / 256)
+
+        if v > 127 then v = 127 end
+        if v < -128 then v = -128 end
+
+        -- 24 kHz OpenAI PCM -> 48 kHz CC speaker audio.
+        out[#out + 1] = v
+        out[#out + 1] = v
+
+        i = i + 2
+    end
+
+    if i <= #chunk then
+        carryByte = chunk:byte(i)
+    end
+
+    return out, carryByte
+end
+
+local function speakOpenAIChunk(text, volume, token, voice, model, instructions)
     if not API_KEY then
-        return false, "OpenAI key missing on node."
+        return false, "OpenAI key missing on node. Add JarvisKey.lua or run reloadkey."
     end
 
     if not http or not http.post then
-        return false, "HTTP unavailable on node."
+        return false, "HTTP POST unavailable on node."
     end
 
-    local payload = textutils.serializeJSON({
+    local body = textutils.serializeJSON({
         model = model or OPENAI_TTS_MODEL,
         voice = voice or OPENAI_TTS_VOICE,
         input = text,
-        instructions = instructions or OPENAI_TTS_INSTRUCTIONS,
+        instructions = instructions,
         response_format = OPENAI_TTS_RESPONSE_FORMAT,
+        speed = OPENAI_TTS_SPEED,
     })
 
     print("[NODE] GPT TTS voice=" .. tostring(voice or OPENAI_TTS_VOICE))
 
-    local response = http.post("https://api.openai.com/v1/audio/speech", payload, {
-        ["Content-Type"] = "application/json",
-        ["Authorization"] = "Bearer " .. API_KEY,
-        ["Accept"] = "audio/pcm",
-        ["User-Agent"] = "CC-JARVIS-SpeakerNode",
-    }, true)
+    local response = http.post(
+        "https://api.openai.com/v1/audio/speech",
+        body,
+        {
+            ["Content-Type"] = "application/json",
+            ["Authorization"] = "Bearer " .. API_KEY,
+            ["User-Agent"] = "CC-JARVIS-SpeakerNode",
+        },
+        true
+    )
 
     if not response then
         return false, "OpenAI TTS HTTP request failed."
     end
 
-    while shouldContinue(token) do
-        local chunk = response.read(OPENAI_TTS_PCM_CHUNK_SIZE)
-        if not chunk then break end
+    local code = 200
+    if response.getResponseCode then
+        local okCode, c = pcall(function()
+            return response.getResponseCode()
+        end)
 
-        local audio = pcm16leToSpeakerBuffer(chunk)
+        if okCode and c then
+            code = tonumber(c) or c
+        end
+    end
+
+    if tostring(code) ~= "200" then
+        local errBody = ""
+        pcall(function()
+            errBody = response.readAll() or ""
+        end)
+        response.close()
+        return false, "OpenAI TTS HTTP " .. tostring(code) .. ": " .. tostring(errBody):sub(1, 200)
+    end
+
+    local carryByte = nil
+
+    while shouldContinue(token) do
+        local raw = response.read(OPENAI_TTS_PCM_CHUNK_SIZE)
+        if not raw then break end
+
+        local audio
+        audio, carryByte = pcm16leToSpeakerBuffer(raw, carryByte)
 
         if #audio > 0 then
             local ok, err = playBufferOnAll(audio, volume or TTS_VOLUME)
@@ -472,18 +532,14 @@ local function playTtsText(text, volume, token, voice, model, instructions)
         return true, "no TTS text"
     end
 
-    if not API_KEY then
-        return false, "OpenAI key missing on node. Add JarvisKey.lua or run reloadkey."
-    end
-
-    local chunks = splitSpeechChunks(text, 700)
+    local chunks = splitSpeechChunks(text, OPENAI_TTS_TEXT_CHUNK_MAX)
 
     for _, chunk in ipairs(chunks) do
         if not shouldContinue(token) then
             return false, "cancelled"
         end
 
-        local ok, err = speakOpenAIChunk(chunk, voice or OPENAI_TTS_VOICE, model or OPENAI_TTS_MODEL, instructions or OPENAI_TTS_INSTRUCTIONS, volume or TTS_VOLUME, token)
+        local ok, err = speakOpenAIChunk(chunk, volume or TTS_VOLUME, token, voice, model, instructions)
 
         if not ok then
             return false, err
@@ -541,7 +597,7 @@ local function listenerLoop()
                     tts_volume = msg.tts_volume or TTS_VOLUME,
                     tts_voice = tostring(msg.voice or msg.tts_voice or OPENAI_TTS_VOICE),
                     tts_model = tostring(msg.tts_model or OPENAI_TTS_MODEL),
-                    tts_instructions = tostring(msg.tts_instructions or OPENAI_TTS_INSTRUCTIONS),
+                    tts_instructions = msg.tts_instructions,
                     music_volume = msg.music_volume or MUSIC_VOLUME,
                 })
 
@@ -556,7 +612,7 @@ local function listenerLoop()
                     volume = msg.volume or TTS_VOLUME,
                     tts_voice = tostring(msg.voice or msg.tts_voice or OPENAI_TTS_VOICE),
                     tts_model = tostring(msg.tts_model or OPENAI_TTS_MODEL),
-                    tts_instructions = tostring(msg.tts_instructions or OPENAI_TTS_INSTRUCTIONS),
+                    tts_instructions = msg.tts_instructions,
                 })
 
                 ack(sender, msg.command_id, true, "speak queued")
