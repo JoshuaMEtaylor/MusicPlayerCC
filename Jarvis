@@ -31,7 +31,7 @@
 --   stopmusic
 -- =============================================================================
 
-local VERSION = "4.3.0-hybrid-raw-audio-controller"
+local VERSION = "4.4.0-hybrid-synced-node-start"
 local args = {...}
 
 -- =============================================================================
@@ -53,8 +53,9 @@ local PA_NODE_PRESTART_DELAY = 0.15
 -- Dumb node mode:
 -- JARVIS does all HTTP/TTS/music decoding.
 -- Nodes only receive raw speaker audio buffers and play them locally.
-local PA_NODE_AUDIO_PACKET_SAMPLES = 2048
+local PA_NODE_AUDIO_PACKET_SAMPLES = 8192
 local PA_NODE_AUDIO_PACKET_GAP = 0
+local PA_NODE_START_DELAY = 0.35
 
 -- Mirror literally all terminal print/write output to every visible monitor.
 local MONITOR_MIRROR_ENABLED = true
@@ -685,6 +686,7 @@ local citySpeakers = {}
 local speakerNodes = {}
 local paCommandCounter = 0
 local paAudioStreamId = "boot"
+local paNodeStreamArmed = false
 local droppedSpeakers = {}
 
 local function peripheralIsSpeaker(name)
@@ -950,6 +952,7 @@ end
 
 local function newNodeAudioStream(reason)
     paAudioStreamId = nextPaCommandId("stream")
+    paNodeStreamArmed = true
 
     print("[NODE] New raw audio stream: " .. paAudioStreamId .. (reason and (" | " .. tostring(reason)) or ""))
 
@@ -966,7 +969,7 @@ local function newNodeAudioStream(reason)
     return paAudioStreamId
 end
 
-local function sendRawAudioToNodes(buffer, volume)
+local function sendRawAudioToNodeslocal function sendRawAudioToNodes(buffer, volume)
     if type(buffer) ~= "table" then
         return false
     end
@@ -1000,6 +1003,21 @@ local function sendRawAudioToNodes(buffer, volume)
         if PA_NODE_AUDIO_PACKET_GAP and PA_NODE_AUDIO_PACKET_GAP > 0 then
             sleep(PA_NODE_AUDIO_PACKET_GAP)
         end
+    end
+
+    -- First buffer of a new stream is pre-sent to the nodes.
+    -- Only after that do we send stream_play and briefly wait, so node speakers
+    -- and direct wired speakers start at roughly the same time.
+    if paNodeStreamArmed then
+        paNodeStreamArmed = false
+
+        rednet.broadcast({
+            type = "stream_play",
+            command_id = nextPaCommandId("stream_play"),
+            stream_id = paAudioStreamId,
+        }, PA_NODE_PROTOCOL)
+
+        sleep(PA_NODE_START_DELAY)
     end
 
     return true
@@ -2767,7 +2785,7 @@ local function chatLoop()
                 print("Morning broadcast language: angry Mandarin only")
                 print("TTS provider: " .. tostring(TTS_PROVIDER))
                 print("OpenAI TTS voice: " .. tostring(OPENAI_TTS_VOICE))
-                print("Speaker audio mode: hybrid direct wired + raw-audio dumb nodes")
+                print("Speaker audio mode: hybrid synced direct wired + raw-audio dumb nodes")
 
             elseif lower == "update" or lower == "selfupdate" then
                 print("Forcing GitHub self-update from:")
