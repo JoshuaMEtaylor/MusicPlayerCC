@@ -16,7 +16,7 @@
 --   3. Attach one speaker directly OR attach a small local wired speaker branch.
 --   4. Run this script as startup.
 
-local VERSION = "2.0.0-dumb-audio-relay"
+local VERSION = "2.1.0-dumb-node-synced-start"
 local PROTOCOL = "JARVIS_PA_V1"
 
 local NODE_LABEL = os.getComputerLabel() or ("SpeakerNode-" .. tostring(os.getComputerID()))
@@ -24,6 +24,7 @@ local NODE_LABEL = os.getComputerLabel() or ("SpeakerNode-" .. tostring(os.getCo
 local localSpeakers = {}
 local audioQueue = {}
 local currentStreamId = nil
+local streamPlaying = false
 local queueLimit = 256
 
 -- =============================================================================
@@ -250,6 +251,7 @@ end
 
 local function clearStream(streamId)
     currentStreamId = streamId
+    streamPlaying = false
     audioQueue = {}
 
     for _, item in ipairs(localSpeakers) do
@@ -259,17 +261,15 @@ local function clearStream(streamId)
     end
 end
 
-local function enqueueAudio(msg)
+local function enqueueAudiolocal function enqueueAudio(msg)
     local streamId = tostring(msg.stream_id or "default")
 
     if currentStreamId ~= streamId then
         clearStream(streamId)
-        print("[NODE] New audio stream: " .. streamId)
+        print("[NODE] New audio stream: " .. streamId .. " (waiting for play)")
     end
 
     if #audioQueue >= queueLimit then
-        -- If this ever happens, the node is falling behind.
-        -- Drop oldest queued audio rather than letting memory explode.
         table.remove(audioQueue, 1)
         print("[NODE] Queue full; dropped oldest packet.")
     end
@@ -279,6 +279,20 @@ local function enqueueAudio(msg)
         volume = msg.volume or 1,
     }
 
+    if streamPlaying then
+        os.queueEvent("jarvis_node_audio")
+    end
+end
+
+local function beginStream(streamId)
+    streamId = tostring(streamId or currentStreamId or "default")
+
+    if currentStreamId ~= streamId then
+        currentStreamId = streamId
+    end
+
+    streamPlaying = true
+    print("[NODE] Stream play: " .. tostring(currentStreamId) .. " | queued=" .. tostring(#audioQueue))
     os.queueEvent("jarvis_node_audio")
 end
 
@@ -306,7 +320,11 @@ local function listenerLoop()
 
             elseif msg.type == "stream_start" then
                 clearStream(tostring(msg.stream_id or "stream"))
-                ack(sender, msg.command_id, true, "stream started")
+                ack(sender, msg.command_id, true, "stream prebuffering")
+
+            elseif msg.type == "stream_play" then
+                beginStream(tostring(msg.stream_id or currentStreamId or "stream"))
+                ack(sender, msg.command_id, true, "stream playing")
 
             elseif msg.type == "audio" then
                 -- No ack per audio packet. That would spam rednet and slow the stream.
@@ -355,6 +373,7 @@ local function commandLoop()
             end
             print("Queue: " .. tostring(#audioQueue))
             print("Current stream: " .. tostring(currentStreamId))
+            print("Playing: " .. boolText(streamPlaying))
 
         elseif lower == "chime" or lower == "test" then
             playChime(1)
@@ -396,6 +415,7 @@ for i, item in ipairs(localSpeakers) do
     print("  " .. tostring(i) .. ". " .. tostring(item.name))
 end
 print("Waiting for raw audio packets from JARVIS...")
+print("Sync mode: prebuffer until stream_play, then local speakers start.")
 print("")
 
 parallel.waitForAny(listenerLoop, audioWorkerLoop, commandLoop)
