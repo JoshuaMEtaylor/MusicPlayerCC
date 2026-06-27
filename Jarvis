@@ -31,7 +31,7 @@
 --   stopmusic
 -- =============================================================================
 
-local VERSION = "2.4.0-speaker-ping-lockstep"
+local VERSION = "2.5.0-speaker-report-monitor"
 local args = {...}
 
 -- =============================================================================
@@ -40,6 +40,12 @@ local args = {...}
 
 local KEY_FILE = "JarvisKey.lua"
 local RAW_RESPONSE_FILE = "jarvis_latest_raw_response.txt"
+
+-- External monitor support.
+-- Attach any monitor/peripheral monitor to the wired network.
+-- JARVIS will use the largest visible monitor for speaker diagnostics.
+local USE_EXTERNAL_MONITOR = true
+local MONITOR_TEXT_SCALE = 0.5
 local DISABLED_SPEAKERS_FILE = "jarvis_disabled_speakers.txt"
 local SPEAKER_BASELINE_FILE = "jarvis_speaker_baseline.txt"
 
@@ -209,6 +215,163 @@ end
 
 local function boolText(v)
     return v and "yes" or "no"
+end
+
+
+-- =============================================================================
+-- TERMINAL + EXTERNAL MONITOR REPORTING
+-- =============================================================================
+
+local reportMon = nil
+local reportMonName = nil
+
+local function findBestMonitor()
+    if not USE_EXTERNAL_MONITOR then return nil, nil end
+
+    local best = nil
+    local bestName = nil
+    local bestArea = 0
+
+    for _, name in ipairs(peripheral.getNames()) do
+        local pType = peripheral.getType(name)
+        local isMonitor = false
+
+        if pType == "monitor" then
+            isMonitor = true
+        elseif type(pType) == "table" then
+            for _, t in ipairs(pType) do
+                if t == "monitor" then isMonitor = true end
+            end
+        end
+
+        if isMonitor then
+            local mon = peripheral.wrap(name)
+
+            if mon and mon.getSize then
+                pcall(function()
+                    mon.setTextScale(MONITOR_TEXT_SCALE)
+                end)
+
+                local w, h = mon.getSize()
+                local area = (tonumber(w) or 0) * (tonumber(h) or 0)
+
+                if area > bestArea then
+                    best = mon
+                    bestName = name
+                    bestArea = area
+                end
+            end
+        end
+    end
+
+    return best, bestName
+end
+
+local function initReportMonitor()
+    reportMon, reportMonName = findBestMonitor()
+
+    if reportMon then
+        pcall(function()
+            reportMon.setTextScale(MONITOR_TEXT_SCALE)
+            reportMon.clear()
+            reportMon.setCursorPos(1, 1)
+        end)
+    end
+
+    return reportMon
+end
+
+local function monWriteLine(lineText)
+    if not reportMon then return end
+
+    pcall(function()
+        local w, h = reportMon.getSize()
+        local x, y = reportMon.getCursorPos()
+
+        if y > h then
+            reportMon.scroll(1)
+            reportMon.setCursorPos(1, h)
+            x, y = reportMon.getCursorPos()
+        end
+
+        local out = tostring(lineText or "")
+        if #out > w then out = out:sub(1, w) end
+
+        reportMon.write(out)
+        reportMon.setCursorPos(1, y + 1)
+    end)
+end
+
+local function monClear(title)
+    initReportMonitor()
+
+    if not reportMon then return end
+
+    pcall(function()
+        reportMon.clear()
+        reportMon.setCursorPos(1, 1)
+    end)
+
+    if title then
+        monWriteLine(title)
+        monWriteLine(string.rep("-", 30))
+    end
+end
+
+local function bothPrint(textLine)
+    print(textLine)
+    monWriteLine(textLine)
+end
+
+local function statusWord(ok, fail, unknown)
+    if ok then return "PASS" end
+    if fail then return "FAIL" end
+    if unknown then return "UNKNOWN" end
+    return "PENDING"
+end
+
+local function renderSpeakerReport(title, rows, summary)
+    monClear(title)
+
+    print("")
+    line()
+    print(title)
+    if reportMonName then
+        print("Monitor: " .. tostring(reportMonName))
+    else
+        print("Monitor: none detected")
+    end
+    line()
+
+    monWriteLine("Monitor: " .. tostring(reportMonName or "none"))
+    monWriteLine("")
+
+    if summary then
+        bothPrint(summary)
+        bothPrint("")
+    end
+
+    bothPrint("No  Name                 Status    Details")
+    bothPrint("--  -------------------  --------  ----------------")
+
+    for _, row in ipairs(rows or {}) do
+        local number = tostring(row.index or "?")
+        if #number < 2 then number = " " .. number end
+
+        local name = tostring(row.name or "?")
+        if #name > 19 then name = name:sub(1, 19) end
+        while #name < 19 do name = name .. " " end
+
+        local status = tostring(row.status or "PENDING")
+        while #status < 8 do status = status .. " " end
+
+        local details = tostring(row.details or "")
+
+        bothPrint(number .. "  " .. name .. "  " .. status .. "  " .. details)
+    end
+
+    line()
+    print("")
 end
 
 local function encodePath(path)
@@ -836,6 +999,7 @@ local function printSpeakers()
     print("Targeted speaker peripherals: " .. tostring(activeSpeakerCount()))
     print("Disabled speaker peripherals: " .. tostring(#citySpeakers - activeSpeakerCount()))
     print("Force all visible speakers: " .. boolText(FORCE_ALL_VISIBLE_SPEAKERS))
+    print("Report monitor: " .. tostring(reportMonName or "none"))
     print("TTS: " .. (TTS_ENABLED and "enabled" or "disabled"))
     print("Music: " .. (MUSIC_VOLUME > 0 and "enabled" or "muted"))
     print("")
@@ -1142,15 +1306,15 @@ local function speakerPingAll(label, debug)
 end
 
 local function preflightSpeakers(label, debug)
-    local ok, err = speakerPingAll(label, debug)
+    local ok, rows = speakerPingReport(label or "preflight")
 
     if not ok then
-        print("[PING] WARNING: " .. tostring(err))
+        print("[PING] WARNING: one or more speakers failed/unknown.")
         print("[PING] JARVIS will still attempt playback to every visible speaker.")
-        return false, err
+        return false, rows
     end
 
-    return true
+    return true, rows
 end
 
 local function lockstepDrainAfterChunk(label, debug, shouldContinue)
@@ -1275,6 +1439,7 @@ local function speakerFanoutDebug()
     print("Visible speakers: " .. tostring(#citySpeakers))
     print("Speakers targeted by audio fanout: " .. tostring(activeSpeakerCount()))
     print("Force all visible speakers: " .. boolText(FORCE_ALL_VISIBLE_SPEAKERS))
+    print("Report monitor: " .. tostring(reportMonName or "none"))
     print("")
 
     for i, item in ipairs(citySpeakers) do
@@ -1331,34 +1496,207 @@ local function speakerDrainDebug()
 end
 
 
-local function speakerPingDebug()
-    print("")
-    line()
-    print("SPEAKER PING DEBUG")
-    print("Visible speakers: " .. tostring(speakerCount()))
-    print("Targeted speakers: " .. tostring(activeSpeakerCount()))
-    print("Force all visible speakers: " .. boolText(FORCE_ALL_VISIBLE_SPEAKERS))
-    print("Lockstep mode: " .. boolText(AUDIO_LOCKSTEP_MODE))
-    print("")
 
+local function makeSpeakerRows()
     scanSpeakers()
+
+    local rows = {}
+
     for i, item in ipairs(citySpeakers) do
-        print(tostring(i) .. ". " .. tostring(item.name))
+        rows[#rows + 1] = {
+            index = i,
+            name = tostring(item.name),
+            status = "PENDING",
+            details = "waiting",
+        }
     end
 
-    print("")
-    local ok, err = speakerPingAll("manual diagnostic", true)
-
-    if ok then
-        print("[PING] RESULT: OK - every targeted speaker accepted and returned speaker_audio_empty.")
-    else
-        print("[PING] RESULT: FAILED - " .. tostring(err))
-    end
-
-    line()
-    print("")
+    return rows
 end
 
+local function updateRow(rows, name, status, details)
+    for _, row in ipairs(rows) do
+        if tostring(row.name) == tostring(name) then
+            row.status = status or row.status
+            row.details = details or row.details
+            return
+        end
+    end
+end
+
+local function countStatuses(rows)
+    local pass, fail, unknown, pending = 0, 0, 0, 0
+
+    for _, row in ipairs(rows or {}) do
+        if row.status == "PASS" then pass = pass + 1
+        elseif row.status == "FAIL" then fail = fail + 1
+        elseif row.status == "UNKNOWN" then unknown = unknown + 1
+        else pending = pending + 1 end
+    end
+
+    return pass, fail, unknown, pending
+end
+
+local function reportSummary(rows)
+    local pass, fail, unknown, pending = countStatuses(rows)
+
+    return "PASS=" .. tostring(pass) ..
+        " FAIL=" .. tostring(fail) ..
+        " UNKNOWN=" .. tostring(unknown) ..
+        " PENDING=" .. tostring(pending)
+end
+
+local function speakerPingReport(label)
+    scanSpeakers()
+
+    local rows = makeSpeakerRows()
+
+    renderSpeakerReport("SPEAKER PING REPORT", rows, "Starting test: " .. tostring(label or "manual"))
+
+    if #rows == 0 then
+        bothPrint("No speakers visible.")
+        return false, rows
+    end
+
+    hardStopAllSpeakers("speaker report ping", true)
+    sleep(0.2)
+
+    local probe = makeSilentProbeBuffer()
+
+    local pendingByName = {}
+    local pendingCount = 0
+
+    for _, row in ipairs(rows) do
+        pendingByName[row.name] = true
+        pendingCount = pendingCount + 1
+    end
+
+    -- Stage 1: can each speaker accept a playAudio buffer?
+    for _, item in ipairs(activeSpeakers()) do
+        local name = tostring(item.name)
+        local ok, accepted = pcall(function()
+            return item.speaker.playAudio(probe, 1)
+        end)
+
+        if ok and accepted then
+            updateRow(rows, name, "UNKNOWN", "accepted; waiting drain")
+        elseif ok and not accepted then
+            updateRow(rows, name, "FAIL", "rejected buffer")
+            if pendingByName[name] then
+                pendingByName[name] = nil
+                pendingCount = pendingCount - 1
+            end
+        else
+            updateRow(rows, name, "FAIL", "error: " .. tostring(accepted):sub(1, 28))
+            if pendingByName[name] then
+                pendingByName[name] = nil
+                pendingCount = pendingCount - 1
+            end
+        end
+    end
+
+    renderSpeakerReport("SPEAKER PING REPORT", rows, "Buffers sent. " .. reportSummary(rows))
+
+    -- Stage 2: wait for each speaker's speaker_audio_empty event.
+    local timer = os.startTimer(SPEAKER_PING_TIMEOUT)
+
+    while pendingCount > 0 do
+        local event, p1 = os.pullEvent()
+
+        if event == "speaker_audio_empty" then
+            if p1 == nil then
+                -- If this CC/mod version does not include names, mark remaining as UNKNOWN.
+                for name, stillPending in pairs(pendingByName) do
+                    if stillPending then
+                        updateRow(rows, name, "UNKNOWN", "empty event unnamed")
+                    end
+                end
+
+                pendingCount = 0
+                break
+            end
+
+            local name = tostring(p1)
+
+            if pendingByName[name] then
+                pendingByName[name] = nil
+                pendingCount = pendingCount - 1
+                updateRow(rows, name, "PASS", "accepted + drained")
+                renderSpeakerReport("SPEAKER PING REPORT", rows, "Receiving responses. " .. reportSummary(rows))
+            end
+        elseif event == "timer" and p1 == timer then
+            for name, stillPending in pairs(pendingByName) do
+                if stillPending then
+                    updateRow(rows, name, "FAIL", "timeout/no empty event")
+                end
+            end
+
+            pendingCount = 0
+            break
+        elseif event == "peripheral" or event == "peripheral_detach" then
+            -- Network changed during the test; mark anything pending unknown.
+            for name, stillPending in pairs(pendingByName) do
+                if stillPending then
+                    updateRow(rows, name, "UNKNOWN", "network changed")
+                end
+            end
+
+            pendingCount = 0
+            break
+        end
+    end
+
+    local pass, fail, unknown, pending = countStatuses(rows)
+    local ok = fail == 0 and unknown == 0 and pending == 0
+
+    renderSpeakerReport("SPEAKER PING FINAL", rows, reportSummary(rows))
+
+    if ok then
+        bothPrint("RESULT: OK - every speaker accepted and drained.")
+    else
+        bothPrint("RESULT: NOT CLEAN - see FAIL/UNKNOWN rows above.")
+    end
+
+    return ok, rows
+end
+
+local function speakerPingDebug()
+    speakerPingReport("manual diagnostic")
+end
+
+
+
+local function speakerAudibleReport()
+    scanSpeakers()
+
+    local rows = makeSpeakerRows()
+    renderSpeakerReport("SPEAKER AUDIBLE TEST", rows, "Sending loud chime sequence to each listed speaker.")
+
+    for _, item in ipairs(citySpeakers) do
+        local name = tostring(item.name)
+        local ok, err = pcall(function()
+            item.speaker.stop()
+            sleep(0.05)
+            item.speaker.playSound("minecraft:block.note_block.chime", 1, 0.7)
+            sleep(0.15)
+            item.speaker.playSound("minecraft:block.note_block.chime", 1, 1.2)
+            sleep(0.15)
+            item.speaker.playSound("minecraft:block.note_block.bell", 1, 1.0)
+        end)
+
+        if ok then
+            updateRow(rows, name, "UNKNOWN", "command sent; must hear locally")
+        else
+            updateRow(rows, name, "FAIL", "sound error: " .. tostring(err):sub(1, 24))
+        end
+
+        renderSpeakerReport("SPEAKER AUDIBLE TEST", rows, reportSummary(rows))
+        sleep(0.3)
+    end
+
+    renderSpeakerReport("SPEAKER AUDIBLE FINAL", rows, reportSummary(rows))
+    bothPrint("NOTE: UNKNOWN means CC accepted the command, but it cannot prove a player heard it.")
+end
 
 local function disableSpeakerCommand(ref)
     scanSpeakers()
@@ -2514,6 +2852,7 @@ local function bootScreen()
     print("TTS: " .. (TTS_ENABLED and "enabled" or "disabled"))
     print("Music tracks loaded: " .. tostring(#musicTracks))
     print("Speaker ping/lockstep: " .. boolText(AUDIO_LOCKSTEP_MODE))
+    print("Report monitor: " .. tostring(reportMonName or "none"))
     print("")
     print("Commands:")
     print("  exit        - close JARVIS")
@@ -2527,7 +2866,8 @@ local function bootScreen()
     print("  testeach    - test every speaker one by one")
     print("  spfanout    - test raw audio fanout to all visible speakers")
     print("  spreset     - hard reset/clear every speaker buffer")
-    print("  spping      - silent ping/handshake every speaker")
+    print("  spping      - report PASS/FAIL for every speaker")
+    print("  sphear      - audible command test report")
     print("  spbase      - save current speaker map")
     print("  spdiff      - compare current speakers to saved map")
     print("  spoffmiss   - disable speakers missing from saved map")
@@ -2607,6 +2947,9 @@ local function chatLoop()
 
             elseif lower == "spping" or lower == "speakerping" or lower == "ping speakers" then
                 speakerPingDebug()
+
+            elseif lower == "sphear" or lower == "sptesthear" or lower == "speakeraudible" then
+                speakerAudibleReport()
 
             elseif lower == "spbase" or lower == "speakerbase" or lower == "speaker baseline" then
                 saveSpeakerBaseline()
@@ -2750,6 +3093,7 @@ end
 math.randomseed(os.epoch and os.epoch("utc") or math.floor(os.clock() * 100000))
 
 loadDisabledSpeakers()
+initReportMonitor()
 
 print("Scanning wired speaker network...")
 local foundSpeakers = scanSpeakers()
