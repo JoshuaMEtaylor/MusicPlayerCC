@@ -31,7 +31,7 @@
 --   stopmusic
 -- =============================================================================
 
-local VERSION = "4.4.0-hybrid-synced-node-start"
+local VERSION = "4.4.1-hybrid-synced-checked"
 local args = {...}
 
 -- =============================================================================
@@ -53,9 +53,9 @@ local PA_NODE_PRESTART_DELAY = 0.15
 -- Dumb node mode:
 -- JARVIS does all HTTP/TTS/music decoding.
 -- Nodes only receive raw speaker audio buffers and play them locally.
-local PA_NODE_AUDIO_PACKET_SAMPLES = 8192
+local PA_NODE_AUDIO_PACKET_SAMPLES = 2048
 local PA_NODE_AUDIO_PACKET_GAP = 0
-local PA_NODE_START_DELAY = 0.35
+local PA_NODE_START_DELAY = 0.15
 
 -- Mirror literally all terminal print/write output to every visible monitor.
 local MONITOR_MIRROR_ENABLED = true
@@ -969,7 +969,7 @@ local function newNodeAudioStream(reason)
     return paAudioStreamId
 end
 
-local function sendRawAudioToNodeslocal function sendRawAudioToNodes(buffer, volume)
+local function sendRawAudioToNodes(buffer, volume)
     if type(buffer) ~= "table" then
         return false
     end
@@ -1005,9 +1005,8 @@ local function sendRawAudioToNodeslocal function sendRawAudioToNodes(buffer, vol
         end
     end
 
-    -- First buffer of a new stream is pre-sent to the nodes.
-    -- Only after that do we send stream_play and briefly wait, so node speakers
-    -- and direct wired speakers start at roughly the same time.
+    -- First audio buffer of a new stream is pre-sent to nodes.
+    -- Then we release the nodes with stream_play and briefly delay direct speakers.
     if paNodeStreamArmed then
         paNodeStreamArmed = false
 
@@ -1022,7 +1021,6 @@ local function sendRawAudioToNodeslocal function sendRawAudioToNodes(buffer, vol
 
     return true
 end
-
 
 local function nodeUpdateAll()
     return sendNodeCommand({ type = "update" }, PA_NODE_ACK_TIMEOUT, true)
@@ -1330,7 +1328,10 @@ local function playAudioBufferOnAll(buffer, volume, debug, shouldContinue)
     local targets = activeBroadcastSpeakers()
 
     if #targets == 0 then
-        return false, "No active broadcast speakers. Run spresume or spuse <speaker>."
+        if debug then
+            print("[AUDIO] No active direct wired speakers; node audio was still broadcast.")
+        end
+        return true
     end
 
     if debug then
