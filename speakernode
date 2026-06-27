@@ -8,7 +8,7 @@
 -- The node does not use OpenAI, JarvisKey, or audio packet streams.
 -- It only uses HTTP to fetch the public TTS/music audio it was told to play.
 
-local VERSION = "3.0.3-command-program-node-gpt-tts-speed-fixed-clean"
+local VERSION = "3.0.4-command-program-node-gpt-tts-streaming-fix"
 local PROTOCOL = "JARVIS_PA_V1"
 
 local NODE_LABEL = os.getComputerLabel() or ("SpeakerNode-" .. tostring(os.getComputerID()))
@@ -24,7 +24,7 @@ local KEY_FILE = "JarvisKey.lua"
 local OPENAI_TTS_MODEL = "gpt-4o-mini-tts"
 local OPENAI_TTS_VOICE = "cedar"
 local OPENAI_TTS_RESPONSE_FORMAT = "pcm"
-local OPENAI_TTS_PCM_CHUNK_SIZE = 65536
+local OPENAI_TTS_PCM_CHUNK_SIZE = 8192
 
 -- OpenAI TTS PCM is 24 kHz mono; ComputerCraft speakers expect 48 kHz.
 -- Duplicate each sample to preserve correct playback speed.
@@ -388,7 +388,7 @@ local function speakOpenAIChunk(text, voice, model, instructions, volume, token)
         response_format = OPENAI_TTS_RESPONSE_FORMAT,
     })
 
-    print("[NODE] GPT TTS voice=" .. tostring(voice or OPENAI_TTS_VOICE) .. " | PCM 24k->48k speed fix")
+    print("[NODE] GPT TTS voice=" .. tostring(voice or OPENAI_TTS_VOICE) .. " | PCM 24k->48k | 8KB stream")
 
     local response = http.post("https://api.openai.com/v1/audio/speech", payload, {
         ["Content-Type"] = "application/json",
