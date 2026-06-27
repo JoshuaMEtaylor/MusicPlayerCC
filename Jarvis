@@ -31,7 +31,7 @@
 --   stopmusic
 -- =============================================================================
 
-local VERSION = "2.5.0-speaker-report-monitor"
+local VERSION = "3.0.0-monitor-mirror-tts-restored"
 local args = {...}
 
 -- =============================================================================
@@ -41,13 +41,9 @@ local args = {...}
 local KEY_FILE = "JarvisKey.lua"
 local RAW_RESPONSE_FILE = "jarvis_latest_raw_response.txt"
 
--- External monitor support.
--- Attach any monitor/peripheral monitor to the wired network.
--- JARVIS will use the largest visible monitor for speaker diagnostics.
-local USE_EXTERNAL_MONITOR = true
+-- Mirror literally all terminal print/write output to every visible monitor.
+local MONITOR_MIRROR_ENABLED = true
 local MONITOR_TEXT_SCALE = 0.5
-local DISABLED_SPEAKERS_FILE = "jarvis_disabled_speakers.txt"
-local SPEAKER_BASELINE_FILE = "jarvis_speaker_baseline.txt"
 
 local UPDATE_ENABLED = true
 local UPDATE_URL = "https://raw.githubusercontent.com/JoshuaMEtaylor/MusicPlayerCC/refs/heads/main/Jarvis"
@@ -59,7 +55,7 @@ local TTS_ENABLED = true
 local TTS_VOLUME = 1.0
 local TTS_SINGLE_REQUEST_MAX_CHARS = 600
 local TTS_TOTAL_MAX_CHARS = 2600
-local AUDIO_WAIT_TIMEOUT = 3.0
+local AUDIO_WAIT_TIMEOUT = 0.35
 
 -- OpenAI neural TTS.
 -- Voices worth trying: cedar, marin, onyx, ballad, verse, coral, nova.
@@ -77,16 +73,14 @@ Delivery: measured pace, clear diction, serious public broadcaster cadence, not 
 Style: suitable for an East Asian dynastic city-state with red and black banners.
 ]=]
 
-
--- Morning broadcasts use a harsher Mandarin announcer style.
--- This only affects the morning programme, not normal chat replies.
+-- Only morning broadcasts use this Mandarin delivery.
+-- Normal JARVIS chat remains English.
 local MORNING_TTS_INSTRUCTIONS = [=[
 Speak in Mandarin Chinese, Putonghua.
-Tone: angry, severe, commanding, disciplined, and official.
-Delivery: forceful state-broadcast cadence, sharp emphasis, controlled anger, clear pronunciation.
+Tone: angry, severe, commanding, official, disciplined, and impatient with disorder.
+Delivery: forceful public-address cadence, sharp emphasis, clear pronunciation.
 Do not scream, distort, mumble, or become cartoonish.
 Keep the voice intelligible over Minecraft speakers.
-Use the fictional Ako Dynasty context only.
 ]=]
 
 -- Emergency fallback if OpenAI TTS fails.
@@ -109,19 +103,6 @@ local MUSIC_API_URL = "https://api.github.com/repos/" .. MUSIC_REPO_USER .. "/" 
 local MUSIC_RAW_BASE = "https://raw.githubusercontent.com/" .. MUSIC_REPO_USER .. "/" .. MUSIC_REPO_NAME .. "/" .. MUSIC_REPO_BRANCH .. "/"
 local MUSIC_VOLUME = 1.0
 local MUSIC_CHUNK_SIZE = 16 * 1024
-local AUDIO_DRAIN_TIMEOUT = 14.0
-local HARD_STOP_PASSES = 5
-local HARD_STOP_GAP = 0.18
-local PRE_MUSIC_SETTLE_SECONDS = 1.0
-local SPEAKER_PING_TIMEOUT = 8.0
-local SPEAKER_PING_ATTEMPTS = 3
-local AUDIO_LOCKSTEP_MODE = true
-local AUDIO_LOCKSTEP_TIMEOUT = 8.0
-
--- Important:
--- When true, JARVIS ignores the disabled-speaker list and attempts to feed every
--- currently visible speaker peripheral. This is the "no exceptions" town PA mode.
-local FORCE_ALL_VISIBLE_SPEAKERS = true
 
 local NATION_NAME = "the Ako Dynasty"
 local LEADER_NAME = "Ako"
@@ -131,8 +112,11 @@ local CULTURAL_THEME = "East Asian dynastic state-radio aesthetic"
 local SYSTEM_PROMPT = [=[
 You are JARVIS, a concise Minecraft ComputerCraft assistant.
 
-You are the official AI public-address voice of the fictional Ako Dynasty.
-The broadcasts are played throughout the city to maintain civic order, compliance, morale, productivity, and continued loyalty.
+Normal operator chat must be in English unless the operator explicitly asks for another language.
+Do not answer normal questions in Mandarin Chinese.
+
+You are also the official AI public-address voice of the fictional Ako Dynasty.
+Broadcasts may use special language/style rules only when the broadcast function explicitly asks for them.
 
 JARVIS can use any speaker peripheral directly visible to this ComputerCraft computer through the wired speaker network.
 JARVIS replies and broadcasts are read aloud over TTS when TTS is enabled.
@@ -144,19 +128,13 @@ Fictional state identity:
 - Colours: red and black / 赤黑.
 - Theme: East Asian dynastic state-radio aesthetic.
 
-Normal chat:
-- Be useful, direct, and conversational.
-- English is acceptable for normal operator chat.
+Normal chat style:
+- English.
+- Useful, direct, and conversational.
+- Do not act like every reply is a public broadcast.
 
-Morning programme:
-- Morning broadcast content must be Simplified Chinese Mandarin only.
-- Do not explain the style requirements.
-- Do not output English bullet points for the morning programme.
-- Do not say "How may I assist you" during a broadcast.
-- The morning broadcast should sound angry, severe, commanding, official, and disciplined.
-- It should introduce the daily patriotic music programme near the end.
-
-Restrictions:
+Broadcast restrictions:
+- Keep it fictional and in-world.
 - Do not reference real-world regimes, countries, ethnic groups, political parties, real leaders, or real propaganda movements.
 - Do not mention China, North Korea, communism, fascism, or any real government.
 - Do not claim you control systems that have not actually been integrated yet.
@@ -219,159 +197,182 @@ end
 
 
 -- =============================================================================
--- TERMINAL + EXTERNAL MONITOR REPORTING
+-- GLOBAL TERMINAL -> MONITOR MIRROR
 -- =============================================================================
 
-local reportMon = nil
-local reportMonName = nil
+local nativePrint = print
+local nativeWrite = write
 
-local function findBestMonitor()
-    if not USE_EXTERNAL_MONITOR then return nil, nil end
+local mirrorMonitors = {}
+local mirrorStarted = false
+local mirrorLineBuffers = {}
 
-    local best = nil
-    local bestName = nil
-    local bestArea = 0
+local function periphHasType(name, wanted)
+    if peripheral.hasType then
+        local ok, result = pcall(function()
+            return peripheral.hasType(name, wanted)
+        end)
+        if ok and result then return true end
+    end
+
+    local pType = peripheral.getType(name)
+    if pType == wanted then return true end
+
+    if type(pType) == "table" then
+        for _, t in ipairs(pType) do
+            if t == wanted then return true end
+        end
+    end
+
+    return false
+end
+
+local function mirrorScanMonitors()
+    mirrorMonitors = {}
+
+    if not MONITOR_MIRROR_ENABLED then
+        return mirrorMonitors
+    end
 
     for _, name in ipairs(peripheral.getNames()) do
-        local pType = peripheral.getType(name)
-        local isMonitor = false
-
-        if pType == "monitor" then
-            isMonitor = true
-        elseif type(pType) == "table" then
-            for _, t in ipairs(pType) do
-                if t == "monitor" then isMonitor = true end
-            end
-        end
-
-        if isMonitor then
+        if periphHasType(name, "monitor") then
             local mon = peripheral.wrap(name)
 
             if mon and mon.getSize then
                 pcall(function()
                     mon.setTextScale(MONITOR_TEXT_SCALE)
+                    mon.clear()
+                    mon.setCursorPos(1, 1)
                 end)
 
                 local w, h = mon.getSize()
-                local area = (tonumber(w) or 0) * (tonumber(h) or 0)
 
-                if area > bestArea then
-                    best = mon
-                    bestName = name
-                    bestArea = area
-                end
+                mirrorMonitors[#mirrorMonitors + 1] = {
+                    name = tostring(name),
+                    monitor = mon,
+                    width = tonumber(w) or 0,
+                    height = tonumber(h) or 0,
+                }
+
+                mirrorLineBuffers[tostring(name)] = ""
             end
         end
     end
 
-    return best, bestName
+    table.sort(mirrorMonitors, function(a, b)
+        return tostring(a.name) < tostring(b.name)
+    end)
+
+    return mirrorMonitors
 end
 
-local function initReportMonitor()
-    reportMon, reportMonName = findBestMonitor()
+local function mirrorScrollIfNeeded(item)
+    local mon = item.monitor
+    local w, h = mon.getSize()
+    local x, y = mon.getCursorPos()
 
-    if reportMon then
+    if y > h then
+        mon.scroll(1)
+        mon.setCursorPos(1, h)
+    end
+end
+
+local function mirrorWriteRaw(textValue)
+    if not mirrorStarted or #mirrorMonitors == 0 then
+        return
+    end
+
+    local textOut = tostring(textValue or "")
+
+    for _, item in ipairs(mirrorMonitors) do
         pcall(function()
-            reportMon.setTextScale(MONITOR_TEXT_SCALE)
-            reportMon.clear()
-            reportMon.setCursorPos(1, 1)
+            local mon = item.monitor
+            local w, h = mon.getSize()
+
+            for part, newline in textOut:gmatch("([^\n]*)(\n?)") do
+                if part ~= "" then
+                    mirrorScrollIfNeeded(item)
+
+                    local x, y = mon.getCursorPos()
+                    local remaining = part
+
+                    while #remaining > 0 do
+                        mirrorScrollIfNeeded(item)
+                        x, y = mon.getCursorPos()
+
+                        local space = w - x + 1
+
+                        if space <= 0 then
+                            mon.setCursorPos(1, y + 1)
+                            mirrorScrollIfNeeded(item)
+                            x, y = mon.getCursorPos()
+                            space = w
+                        end
+
+                        local chunk = remaining:sub(1, space)
+                        mon.write(chunk)
+                        remaining = remaining:sub(space + 1)
+
+                        x, y = mon.getCursorPos()
+                        mon.setCursorPos(x + #chunk, y)
+                    end
+                end
+
+                if newline == "\n" then
+                    local x, y = mon.getCursorPos()
+                    mon.setCursorPos(1, y + 1)
+                    mirrorScrollIfNeeded(item)
+                end
+
+                if newline == "" then
+                    break
+                end
+            end
         end)
     end
-
-    return reportMon
 end
 
-local function monWriteLine(lineText)
-    if not reportMon then return end
+local function startMonitorMirror()
+    mirrorStarted = true
+    mirrorScanMonitors()
 
-    pcall(function()
-        local w, h = reportMon.getSize()
-        local x, y = reportMon.getCursorPos()
-
-        if y > h then
-            reportMon.scroll(1)
-            reportMon.setCursorPos(1, h)
-            x, y = reportMon.getCursorPos()
-        end
-
-        local out = tostring(lineText or "")
-        if #out > w then out = out:sub(1, w) end
-
-        reportMon.write(out)
-        reportMon.setCursorPos(1, y + 1)
-    end)
-end
-
-local function monClear(title)
-    initReportMonitor()
-
-    if not reportMon then return end
-
-    pcall(function()
-        reportMon.clear()
-        reportMon.setCursorPos(1, 1)
-    end)
-
-    if title then
-        monWriteLine(title)
-        monWriteLine(string.rep("-", 30))
+    if #mirrorMonitors > 0 then
+        mirrorWriteRaw("JARVIS MONITOR MIRROR ONLINE\n")
+        mirrorWriteRaw("Mirroring terminal output to " .. tostring(#mirrorMonitors) .. " monitor(s).\n")
+        mirrorWriteRaw("----------------------------------------\n")
     end
 end
 
-local function bothPrint(textLine)
-    print(textLine)
-    monWriteLine(textLine)
+local function refreshMonitorMirror()
+    mirrorScanMonitors()
+    print("Monitor mirror refreshed. Visible monitors: " .. tostring(#mirrorMonitors))
+
+    for i, item in ipairs(mirrorMonitors) do
+        print(tostring(i) .. ". " .. tostring(item.name) .. " " .. tostring(item.width) .. "x" .. tostring(item.height))
+    end
 end
 
-local function statusWord(ok, fail, unknown)
-    if ok then return "PASS" end
-    if fail then return "FAIL" end
-    if unknown then return "UNKNOWN" end
-    return "PENDING"
+local function monitorMirrorTest()
+    refreshMonitorMirror()
+    print("MONITOR TEST: If you can read this on the large monitor, mirroring is working.")
 end
 
-local function renderSpeakerReport(title, rows, summary)
-    monClear(title)
+print = function(...)
+    nativePrint(...)
 
-    print("")
-    line()
-    print(title)
-    if reportMonName then
-        print("Monitor: " .. tostring(reportMonName))
-    else
-        print("Monitor: none detected")
-    end
-    line()
+    local args = {...}
+    local out = {}
 
-    monWriteLine("Monitor: " .. tostring(reportMonName or "none"))
-    monWriteLine("")
-
-    if summary then
-        bothPrint(summary)
-        bothPrint("")
+    for i = 1, #args do
+        out[#out + 1] = tostring(args[i])
     end
 
-    bothPrint("No  Name                 Status    Details")
-    bothPrint("--  -------------------  --------  ----------------")
+    mirrorWriteRaw(table.concat(out, "\t") .. "\n")
+end
 
-    for _, row in ipairs(rows or {}) do
-        local number = tostring(row.index or "?")
-        if #number < 2 then number = " " .. number end
-
-        local name = tostring(row.name or "?")
-        if #name > 19 then name = name:sub(1, 19) end
-        while #name < 19 do name = name .. " " end
-
-        local status = tostring(row.status or "PENDING")
-        while #status < 8 do status = status .. " " end
-
-        local details = tostring(row.details or "")
-
-        bothPrint(number .. "  " .. name .. "  " .. status .. "  " .. details)
-    end
-
-    line()
-    print("")
+write = function(value)
+    nativeWrite(value)
+    mirrorWriteRaw(tostring(value or ""))
 end
 
 local function encodePath(path)
@@ -392,10 +393,10 @@ end
 -- SAFE SELF UPDATE
 -- =============================================================================
 
-local function selfUpdate(force)
+local function selfUpdate()
     if not UPDATE_ENABLED then return end
 
-    if hasArg(UPDATE_SKIP_ARG) and not force then
+    if hasArg(UPDATE_SKIP_ARG) then
         print("Auto-update skipped for freshly relaunched copy.")
         return
     end
@@ -485,7 +486,7 @@ local function selfUpdate(force)
     return "updated"
 end
 
-local updateResult = selfUpdate(false)
+local updateResult = selfUpdate()
 if updateResult == "updated" then return end
 
 -- =============================================================================
@@ -614,59 +615,6 @@ local function callOpenAI(messages, overrideSystemPrompt)
     return text, nil
 end
 
-
--- =============================================================================
--- SPEAKER ENABLE / DISABLE LIST
--- =============================================================================
-
-local disabledSpeakers = {}
-
-local function loadDisabledSpeakers()
-    disabledSpeakers = {}
-
-    local raw = readAll(DISABLED_SPEAKERS_FILE)
-    if not raw then return end
-
-    for lineText in raw:gmatch("[^\r\n]+") do
-        local name = trim(lineText)
-        if name ~= "" then
-            disabledSpeakers[name] = true
-        end
-    end
-end
-
-local function saveDisabledSpeakers()
-    local names = {}
-
-    for name, disabled in pairs(disabledSpeakers) do
-        if disabled then names[#names + 1] = name end
-    end
-
-    table.sort(names)
-    writeFile(DISABLED_SPEAKERS_FILE, table.concat(names, "\n"))
-end
-
-local function isSpeakerDisabled(name)
-    return disabledSpeakers[tostring(name or "")] == true
-end
-
-local function setSpeakerDisabled(name, disabled)
-    name = tostring(name or "")
-
-    if name == "" then
-        return false, "No speaker name supplied."
-    end
-
-    if disabled then
-        disabledSpeakers[name] = true
-    else
-        disabledSpeakers[name] = nil
-    end
-
-    saveDisabledSpeakers()
-    return true
-end
-
 -- =============================================================================
 -- WIRED SPEAKER PERIPHERAL DISCOVERY
 -- =============================================================================
@@ -708,7 +656,6 @@ local function scanSpeakers()
                     name = name,
                     speaker = wrapped,
                     type = peripheral.getType(name),
-                    disabled = isSpeakerDisabled(name),
                 }
             end
         end
@@ -724,248 +671,6 @@ end
 local function speakerCount()
     return #citySpeakers
 end
-
-local function activeSpeakers()
-    local list = {}
-
-    for _, item in ipairs(citySpeakers) do
-        if FORCE_ALL_VISIBLE_SPEAKERS or not isSpeakerDisabled(item.name) then
-            list[#list + 1] = item
-        end
-    end
-
-    return list
-end
-
-local function activeSpeakerCount()
-    local count = 0
-
-    for _, item in ipairs(citySpeakers) do
-        if FORCE_ALL_VISIBLE_SPEAKERS or not isSpeakerDisabled(item.name) then
-            count = count + 1
-        end
-    end
-
-    return count
-end
-
-local function resolveSpeakerRef(ref)
-    ref = trim(ref or "")
-
-    if ref == "" then return nil, "No speaker reference supplied." end
-
-    local asNumber = tonumber(ref)
-    if asNumber and citySpeakers[asNumber] then
-        return citySpeakers[asNumber]
-    end
-
-    for _, item in ipairs(citySpeakers) do
-        if tostring(item.name) == ref then
-            return item
-        end
-    end
-
-    return nil, "No visible speaker matches '" .. tostring(ref) .. "'."
-end
-
-
-local function visibleSpeakerNames()
-    local names = {}
-
-    for _, name in ipairs(peripheral.getNames()) do
-        if peripheralIsSpeaker and peripheralIsSpeaker(name) then
-            names[#names + 1] = tostring(name)
-        end
-    end
-
-    table.sort(names)
-    return names
-end
-
-local function saveSpeakerBaseline()
-    scanSpeakers()
-
-    local names = {}
-
-    for _, item in ipairs(citySpeakers) do
-        names[#names + 1] = tostring(item.name)
-    end
-
-    table.sort(names)
-    writeFile(SPEAKER_BASELINE_FILE, table.concat(names, "\n"))
-
-    print("Saved speaker baseline: " .. tostring(#names) .. " speaker(s).")
-    for i, name in ipairs(names) do
-        print(tostring(i) .. ". " .. tostring(name))
-    end
-end
-
-local function readSpeakerBaseline()
-    local raw = readAll(SPEAKER_BASELINE_FILE)
-
-    if not raw or trim(raw) == "" then
-        return nil
-    end
-
-    local names = {}
-
-    for lineText in raw:gmatch("[^\r\n]+") do
-        local name = trim(lineText)
-        if name ~= "" then
-            names[#names + 1] = name
-        end
-    end
-
-    table.sort(names)
-    return names
-end
-
-local function tableSet(list)
-    local set = {}
-
-    for _, v in ipairs(list or {}) do
-        set[tostring(v)] = true
-    end
-
-    return set
-end
-
-local function diffSpeakerBaseline()
-    local baseline = readSpeakerBaseline()
-
-    if not baseline then
-        print("No speaker baseline saved yet.")
-        print("Run: spbase")
-        return nil
-    end
-
-    scanSpeakers()
-
-    local current = {}
-
-    for _, item in ipairs(citySpeakers) do
-        current[#current + 1] = tostring(item.name)
-    end
-
-    table.sort(current)
-
-    local baseSet = tableSet(baseline)
-    local currSet = tableSet(current)
-
-    local missing = {}
-    local new = {}
-
-    for _, name in ipairs(baseline) do
-        if not currSet[name] then
-            missing[#missing + 1] = name
-        end
-    end
-
-    for _, name in ipairs(current) do
-        if not baseSet[name] then
-            new[#new + 1] = name
-        end
-    end
-
-    print("")
-    line()
-    print("SPEAKER BASELINE DIFF")
-    print("Baseline: " .. tostring(#baseline))
-    print("Current:  " .. tostring(#current))
-    print("Missing:  " .. tostring(#missing))
-    print("New:      " .. tostring(#new))
-    print("")
-
-    if #missing > 0 then
-        print("Missing speaker name(s):")
-        for _, name in ipairs(missing) do
-            print("  " .. tostring(name))
-        end
-        print("")
-        print("If you disconnected the broken physical speaker, disable it with:")
-        for _, name in ipairs(missing) do
-            print("  spoffname " .. tostring(name))
-        end
-    else
-        print("No baseline speakers are missing.")
-    end
-
-    if #new > 0 then
-        print("")
-        print("New speaker name(s):")
-        for _, name in ipairs(new) do
-            print("  " .. tostring(name))
-        end
-    end
-
-    line()
-    print("")
-
-    return {
-        baseline = baseline,
-        current = current,
-        missing = missing,
-        new = new,
-    }
-end
-
-local function disableMissingFromBaseline()
-    local diff = diffSpeakerBaseline()
-
-    if not diff or not diff.missing or #diff.missing == 0 then
-        print("No missing baseline speakers to disable.")
-        return
-    end
-
-    for _, name in ipairs(diff.missing) do
-        setSpeakerDisabled(name, true)
-        print("Disabled missing speaker: " .. tostring(name))
-    end
-
-    print("")
-    print("Reconnect the physical speaker now if you want.")
-    print("JARVIS will see it later, but skip it for TTS/music.")
-end
-
-local function disableSpeakerNameCommand(name)
-    name = trim(name or "")
-
-    if name == "" then
-        print("Usage: spoffname <speaker_name>")
-        return
-    end
-
-    local ok, msg = setSpeakerDisabled(name, true)
-
-    if ok then
-        print("Disabled speaker by name: " .. tostring(name))
-        print("This works even if it is currently disconnected.")
-    else
-        print("Could not disable speaker: " .. tostring(msg))
-    end
-
-    scanSpeakers()
-end
-
-local function enableSpeakerNameCommand(name)
-    name = trim(name or "")
-
-    if name == "" then
-        print("Usage: sponname <speaker_name>")
-        return
-    end
-
-    local ok, msg = setSpeakerDisabled(name, false)
-
-    if ok then
-        print("Enabled speaker by name: " .. tostring(name))
-    else
-        print("Could not enable speaker: " .. tostring(msg))
-    end
-
-    scanSpeakers()
-end
-
 
 local function printAllPeripherals()
     print("")
@@ -983,8 +688,7 @@ local function printAllPeripherals()
     for _, name in ipairs(names) do
         local pType = peripheral.getType(name)
         local hasSpeaker = peripheralIsSpeaker(name)
-        local disabled = hasSpeaker and isSpeakerDisabled(name)
-        print(tostring(name) .. "  type=" .. textutils.serialize(pType) .. "  speaker=" .. boolText(hasSpeaker) .. "  disabled=" .. boolText(disabled))
+        print(tostring(name) .. "  type=" .. textutils.serialize(pType) .. "  speaker=" .. boolText(hasSpeaker))
     end
 
     line()
@@ -996,10 +700,6 @@ local function printSpeakers()
     line()
     print("WIRED CITY SPEAKER NETWORK")
     print("Detected speaker peripherals: " .. tostring(#citySpeakers))
-    print("Targeted speaker peripherals: " .. tostring(activeSpeakerCount()))
-    print("Disabled speaker peripherals: " .. tostring(#citySpeakers - activeSpeakerCount()))
-    print("Force all visible speakers: " .. boolText(FORCE_ALL_VISIBLE_SPEAKERS))
-    print("Report monitor: " .. tostring(reportMonName or "none"))
     print("TTS: " .. (TTS_ENABLED and "enabled" or "disabled"))
     print("Music: " .. (MUSIC_VOLUME > 0 and "enabled" or "muted"))
     print("")
@@ -1016,8 +716,7 @@ local function printSpeakers()
         print("Use command: peripherals")
     else
         for i, item in ipairs(citySpeakers) do
-            local status = (isSpeakerDisabled(item.name) and not FORCE_ALL_VISIBLE_SPEAKERS) and "DISABLED" or "active"
-            print(tostring(i) .. ". " .. tostring(item.name) .. " [" .. status .. "] type=" .. textutils.serialize(item.type))
+            print(tostring(i) .. ". " .. tostring(item.name) .. " type=" .. textutils.serialize(item.type))
         end
     end
 
@@ -1032,7 +731,7 @@ local function rescanSpeakers()
     printSpeakers()
 end
 
-local function waitSpeakerEventForPending(pendingByName, shouldContinue)
+local function waitSpeakerEvent(shouldContinue)
     local timer = os.startTimer(AUDIO_WAIT_TIMEOUT)
 
     while true do
@@ -1043,318 +742,80 @@ local function waitSpeakerEventForPending(pendingByName, shouldContinue)
         local event, p1 = os.pullEvent()
 
         if event == "speaker_audio_empty" then
-            -- CC:Tweaked sends the speaker peripheral name as p1.
-            -- If a name is supplied, only use it when one of our pending speakers is ready.
-            -- If a mod/version omits the name, wake anyway and retry all pending speakers.
-            if p1 == nil or pendingByName[tostring(p1)] then
-                return true
-            end
-        elseif event == "peripheral" or event == "peripheral_detach" then
-            -- Wires/modems may change while running. Rescan and let caller retry.
             return true
         elseif event == "timer" and p1 == timer then
-            -- Timeout retry. This avoids getting stuck if an empty event is missed.
             return true
         end
     end
 end
 
 local function playAudioBufferOnAll(buffer, volume, debug, shouldContinue)
-    -- Always rescan for fanout. Remote speaker networks can change while the city is running.
-    scanSpeakers()
+    if #citySpeakers == 0 then scanSpeakers() end
 
-    local speakersToUse = activeSpeakers()
-
-    if #speakersToUse == 0 then
-        return false, "No active speaker peripherals."
+    if #citySpeakers == 0 then
+        return false, "No visible speaker peripherals."
     end
 
     local pending = {}
-    local pendingByName = {}
-    local pendingCount = 0
-
-    for _, item in ipairs(speakersToUse) do
-        pending[#pending + 1] = item
-        pendingByName[tostring(item.name)] = true
-        pendingCount = pendingCount + 1
-    end
+    for i = 1, #citySpeakers do pending[i] = true end
 
     local attempts = 0
-    local maxAttempts = 200
 
-    while pendingCount > 0 do
+    while true do
         if shouldContinue and not shouldContinue() then
             return false, "cancelled"
         end
 
         attempts = attempts + 1
+        local remaining = 0
+        local hadError = false
 
-        if attempts > maxAttempts then
-            local missing = {}
-            for _, item in ipairs(pending) do
-                if pendingByName[tostring(item.name)] then
-                    missing[#missing + 1] = tostring(item.name)
-                end
-            end
-
-            return false, "Timed out sending audio buffer to: " .. table.concat(missing, ", ")
-        end
-
-        for _, item in ipairs(pending) do
-            local name = tostring(item.name)
-
-            if pendingByName[name] then
+        for i, item in ipairs(citySpeakers) do
+            if pending[i] then
                 local ok, accepted = pcall(function()
                     return item.speaker.playAudio(buffer, volume or 1)
                 end)
 
                 if ok and accepted then
-                    pendingByName[name] = nil
-                    pendingCount = pendingCount - 1
-
-                    if debug then
-                        print("[AUDIO] accepted: " .. name)
+                    pending[i] = false
+                else
+                    remaining = remaining + 1
+                    if not ok then
+                        hadError = true
+                        if debug then
+                            print("playAudio error on " .. tostring(item.name) .. ": " .. tostring(accepted))
+                        end
                     end
-                elseif not ok then
-                    if debug then
-                        print("[AUDIO] playAudio error on " .. name .. ": " .. tostring(accepted))
-                    end
-
-                    -- The peripheral may have rewrapped badly. Rescan next retry.
-                    scanSpeakers()
                 end
             end
         end
 
-        if pendingCount > 0 then
-            local waited, waitErr = waitSpeakerEventForPending(pendingByName, shouldContinue)
-            if not waited then
-                return false, waitErr
-            end
+        if remaining == 0 then
+            return true
         end
 
-        sleep(0)
-    end
-
-    return true
-end
-
-
-local function waitForTargetSpeakersEmpty(label, timeoutSeconds, debug, shouldContinue)
-    scanSpeakers()
-
-    local speakersToUse = activeSpeakers()
-
-    if #speakersToUse == 0 then
-        return false, "No targeted speakers."
-    end
-
-    local pending = {}
-    local pendingCount = 0
-
-    for _, item in ipairs(speakersToUse) do
-        local name = tostring(item.name)
-        pending[name] = true
-        pendingCount = pendingCount + 1
-    end
-
-    local timer = os.startTimer(timeoutSeconds or AUDIO_DRAIN_TIMEOUT)
-
-    if debug then
-        print("[AUDIO] Waiting for final buffer drain: " .. tostring(label or "audio") .. " on " .. tostring(pendingCount) .. " speaker(s).")
-    end
-
-    while pendingCount > 0 do
-        if shouldContinue and not shouldContinue() then
-            return false, "cancelled"
+        if hadError and attempts > 3 then
+            return false, "One or more speakers rejected audio buffers."
         end
 
-        local event, p1 = os.pullEvent()
-
-        if event == "speaker_audio_empty" then
-            if p1 == nil then
-                -- Older/weird versions may not provide the name. Treat as enough signal to continue.
-                if debug then print("[AUDIO] unnamed speaker_audio_empty event received.") end
-                return true
-            end
-
-            local name = tostring(p1)
-
-            if pending[name] then
-                pending[name] = nil
-                pendingCount = pendingCount - 1
-
-                if debug then
-                    print("[AUDIO] drained: " .. name .. " (" .. tostring(pendingCount) .. " left)")
-                end
-            end
-        elseif event == "peripheral" or event == "peripheral_detach" then
-            -- If the network changes mid-broadcast, do not deadlock waiting for old names.
-            if debug then print("[AUDIO] peripheral network changed while draining.") end
-            return false, "speaker network changed"
-        elseif event == "timer" and p1 == timer then
-            local missing = {}
-
-            for name, stillPending in pairs(pending) do
-                if stillPending then missing[#missing + 1] = name end
-            end
-
-            table.sort(missing)
-
-            return false, "Drain timeout waiting for: " .. table.concat(missing, ", ")
+        local waited, waitErr = waitSpeakerEvent(shouldContinue)
+        if not waited then
+            return false, waitErr
         end
     end
-
-    return true
 end
-
-local function hardStopAllSpeakers(reason, verbose)
-    scanSpeakers()
-
-    local count = 0
-
-    if verbose then
-        print("[AUDIO] Hard stop " .. tostring(reason or "") .. " across " .. tostring(#citySpeakers) .. " visible speaker(s).")
-    end
-
-    for pass = 1, HARD_STOP_PASSES do
-        for _, item in ipairs(citySpeakers) do
-            local ok = pcall(function()
-                item.speaker.stop()
-            end)
-
-            if ok and pass == 1 then
-                count = count + 1
-            end
-        end
-
-        sleep(HARD_STOP_GAP)
-    end
-
-    os.queueEvent("jarvis_audio_reset")
-
-    if verbose then
-        print("[AUDIO] Hard stop reached " .. tostring(count) .. " speaker(s).")
-    end
-
-    return count
-end
-
-local function resetAudioNetwork(reason)
-    local count = hardStopAllSpeakers(reason or "reset", true)
-
-    -- Give clients/server a small moment to process stop packets before new audio begins.
-    sleep(PRE_MUSIC_SETTLE_SECONDS)
-
-    return count
-end
-
-
-local function makeSilentProbeBuffer()
-    local buffer = {}
-
-    -- Short silent PCM probe. It should not be audible, but it still goes
-    -- through speaker.playAudio and should produce speaker_audio_empty.
-    for i = 1, 4096 do
-        buffer[i] = 0
-    end
-
-    return buffer
-end
-
-local function speakerPingAll(label, debug)
-    scanSpeakers()
-
-    local targetCount = activeSpeakerCount()
-
-    if targetCount == 0 then
-        return false, "No targeted speakers."
-    end
-
-    if debug then
-        print("[PING] Speaker ping: " .. tostring(label or "audio") .. " | targets=" .. tostring(targetCount) .. "/" .. tostring(speakerCount()))
-    end
-
-    local probe = makeSilentProbeBuffer()
-
-    for attempt = 1, SPEAKER_PING_ATTEMPTS do
-        if debug then
-            print("[PING] Attempt " .. tostring(attempt) .. "/" .. tostring(SPEAKER_PING_ATTEMPTS))
-        end
-
-        hardStopAllSpeakers("speaker ping", debug)
-        sleep(0.2)
-
-        local sent, sendErr = playAudioBufferOnAll(probe, 1, debug, nil)
-
-        if sent then
-            local drained, drainErr = waitForTargetSpeakersEmpty("speaker ping " .. tostring(label or ""), SPEAKER_PING_TIMEOUT, debug, nil)
-
-            if drained then
-                if debug then print("[PING] All targeted speakers responded.") end
-                return true
-            end
-
-            if debug then print("[PING] Drain failed: " .. tostring(drainErr)) end
-        else
-            if debug then print("[PING] Send failed: " .. tostring(sendErr)) end
-        end
-    end
-
-    hardStopAllSpeakers("failed speaker ping", debug)
-    return false, "One or more speakers did not respond to ping."
-end
-
-local function preflightSpeakers(label, debug)
-    local ok, rows = speakerPingReport(label or "preflight")
-
-    if not ok then
-        print("[PING] WARNING: one or more speakers failed/unknown.")
-        print("[PING] JARVIS will still attempt playback to every visible speaker.")
-        return false, rows
-    end
-
-    return true, rows
-end
-
-local function lockstepDrainAfterChunk(label, debug, shouldContinue)
-    if not AUDIO_LOCKSTEP_MODE then
-        return true
-    end
-
-    local drained, drainErr = waitForTargetSpeakersEmpty(label or "audio chunk", AUDIO_LOCKSTEP_TIMEOUT, debug, shouldContinue)
-
-    if not drained then
-        if drainErr == "cancelled" then
-            return false, drainErr
-        end
-
-        if debug then
-            print("[SYNC] Lockstep drain warning: " .. tostring(drainErr))
-        end
-
-        -- Keep all speakers together. If one misses its ready event, reset all
-        -- buffers so it cannot lag behind with old audio.
-        hardStopAllSpeakers("lockstep recovery", debug)
-    end
-
-    return true
-end
-
 
 local function playOnAllSpeakers(sound, volume, pitch)
     if #citySpeakers == 0 then scanSpeakers() end
 
-    local speakersToUse = activeSpeakers()
-
-    if #speakersToUse == 0 then
-        print("No active speaker peripherals.")
+    if #citySpeakers == 0 then
+        print("No visible speaker peripherals.")
         return false, 0
     end
 
     local okCount = 0
 
-    for _, item in ipairs(speakersToUse) do
+    for _, item in ipairs(citySpeakers) do
         local ok, err = pcall(function()
             item.speaker.playSound(sound, volume or 1, pitch or 1)
         end)
@@ -1370,7 +831,18 @@ local function playOnAllSpeakers(sound, volume, pitch)
 end
 
 local function stopAllSpeakers()
-    local count = hardStopAllSpeakers("manual stop", false)
+    if #citySpeakers == 0 then scanSpeakers() end
+
+    local count = 0
+
+    for _, item in ipairs(citySpeakers) do
+        local ok = pcall(function()
+            item.speaker.stop()
+        end)
+
+        if ok then count = count + 1 end
+    end
+
     print("Stopped " .. tostring(count) .. " speaker(s).")
 end
 
@@ -1380,363 +852,6 @@ local function testSpeakers()
     if ok then
         print("Test sound played on " .. tostring(count) .. " speaker(s).")
     end
-end
-
-
-local function testEachSpeaker()
-    scanSpeakers()
-
-    if #citySpeakers == 0 then
-        print("No visible speakers to test.")
-        return
-    end
-
-    print("")
-    line()
-    print("ONE-BY-ONE SPEAKER TEST")
-    print("Stand near the speaker network and note which numbered speaker is silent.")
-    print("This tests disabled speakers too, so you can identify a broken one.")
-    print("")
-
-    for i, item in ipairs(citySpeakers) do
-        local status = (isSpeakerDisabled(item.name) and not FORCE_ALL_VISIBLE_SPEAKERS) and "DISABLED" or "active"
-        print("Testing " .. tostring(i) .. ": " .. tostring(item.name) .. " [" .. status .. "]")
-
-        local ok, err = pcall(function()
-            item.speaker.stop()
-            sleep(0.05)
-            item.speaker.playSound("minecraft:block.note_block.chime", 1, 0.8)
-            sleep(0.25)
-            item.speaker.playSound("minecraft:block.note_block.chime", 1, 1.2)
-        end)
-
-        if not ok then
-            print("  ERROR: " .. tostring(err))
-        end
-
-        sleep(1.1)
-    end
-
-    print("")
-    print("To disable the silent one:")
-    print("  spoff <number>")
-    print("Example:")
-    print("  spoff 7")
-    print("")
-    print("To re-enable it:")
-    print("  spon <number>")
-    line()
-    print("")
-end
-
-
-local function speakerFanoutDebug()
-    scanSpeakers()
-
-    print("")
-    line()
-    print("SPEAKER FANOUT DEBUG")
-    print("Visible speakers: " .. tostring(#citySpeakers))
-    print("Speakers targeted by audio fanout: " .. tostring(activeSpeakerCount()))
-    print("Force all visible speakers: " .. boolText(FORCE_ALL_VISIBLE_SPEAKERS))
-    print("Report monitor: " .. tostring(reportMonName or "none"))
-    print("")
-
-    for i, item in ipairs(citySpeakers) do
-        local target = "TARGETED"
-        if not FORCE_ALL_VISIBLE_SPEAKERS and isSpeakerDisabled(item.name) then
-            target = "SKIPPED"
-        end
-
-        print(tostring(i) .. ". " .. tostring(item.name) .. " [" .. target .. "]")
-    end
-
-    print("")
-    print("Sending one short PCM beep buffer to every targeted speaker...")
-    local buffer = {}
-    for i = 1, 12000 do
-        if i % 80 < 40 then
-            buffer[i] = 60
-        else
-            buffer[i] = -60
-        end
-    end
-
-    local ok, err = playAudioBufferOnAll(buffer, 1, true, nil)
-
-    if ok then
-        print("Fanout test accepted by every targeted speaker.")
-        local drained, drainErr = waitForTargetSpeakersEmpty("fanout debug", SPEAKER_PING_TIMEOUT, true, nil)
-        if drained then
-            print("Fanout test drained/responded from every targeted speaker.")
-        else
-            print("Fanout drain failed: " .. tostring(drainErr))
-        end
-    else
-        print("Fanout test failed: " .. tostring(err))
-    end
-
-    line()
-    print("")
-end
-
-
-local function speakerDrainDebug()
-    print("")
-    line()
-    print("AUDIO DRAIN / RESET DEBUG")
-    print("Visible speakers before reset: " .. tostring(speakerCount()))
-    print("Targeted speakers before reset: " .. tostring(activeSpeakerCount()))
-    resetAudioNetwork("diagnostic reset")
-    scanSpeakers()
-    print("Visible speakers after reset: " .. tostring(speakerCount()))
-    print("Targeted speakers after reset: " .. tostring(activeSpeakerCount()))
-    line()
-    print("")
-end
-
-
-
-local function makeSpeakerRows()
-    scanSpeakers()
-
-    local rows = {}
-
-    for i, item in ipairs(citySpeakers) do
-        rows[#rows + 1] = {
-            index = i,
-            name = tostring(item.name),
-            status = "PENDING",
-            details = "waiting",
-        }
-    end
-
-    return rows
-end
-
-local function updateRow(rows, name, status, details)
-    for _, row in ipairs(rows) do
-        if tostring(row.name) == tostring(name) then
-            row.status = status or row.status
-            row.details = details or row.details
-            return
-        end
-    end
-end
-
-local function countStatuses(rows)
-    local pass, fail, unknown, pending = 0, 0, 0, 0
-
-    for _, row in ipairs(rows or {}) do
-        if row.status == "PASS" then pass = pass + 1
-        elseif row.status == "FAIL" then fail = fail + 1
-        elseif row.status == "UNKNOWN" then unknown = unknown + 1
-        else pending = pending + 1 end
-    end
-
-    return pass, fail, unknown, pending
-end
-
-local function reportSummary(rows)
-    local pass, fail, unknown, pending = countStatuses(rows)
-
-    return "PASS=" .. tostring(pass) ..
-        " FAIL=" .. tostring(fail) ..
-        " UNKNOWN=" .. tostring(unknown) ..
-        " PENDING=" .. tostring(pending)
-end
-
-local function speakerPingReport(label)
-    scanSpeakers()
-
-    local rows = makeSpeakerRows()
-
-    renderSpeakerReport("SPEAKER PING REPORT", rows, "Starting test: " .. tostring(label or "manual"))
-
-    if #rows == 0 then
-        bothPrint("No speakers visible.")
-        return false, rows
-    end
-
-    hardStopAllSpeakers("speaker report ping", true)
-    sleep(0.2)
-
-    local probe = makeSilentProbeBuffer()
-
-    local pendingByName = {}
-    local pendingCount = 0
-
-    for _, row in ipairs(rows) do
-        pendingByName[row.name] = true
-        pendingCount = pendingCount + 1
-    end
-
-    -- Stage 1: can each speaker accept a playAudio buffer?
-    for _, item in ipairs(activeSpeakers()) do
-        local name = tostring(item.name)
-        local ok, accepted = pcall(function()
-            return item.speaker.playAudio(probe, 1)
-        end)
-
-        if ok and accepted then
-            updateRow(rows, name, "UNKNOWN", "accepted; waiting drain")
-        elseif ok and not accepted then
-            updateRow(rows, name, "FAIL", "rejected buffer")
-            if pendingByName[name] then
-                pendingByName[name] = nil
-                pendingCount = pendingCount - 1
-            end
-        else
-            updateRow(rows, name, "FAIL", "error: " .. tostring(accepted):sub(1, 28))
-            if pendingByName[name] then
-                pendingByName[name] = nil
-                pendingCount = pendingCount - 1
-            end
-        end
-    end
-
-    renderSpeakerReport("SPEAKER PING REPORT", rows, "Buffers sent. " .. reportSummary(rows))
-
-    -- Stage 2: wait for each speaker's speaker_audio_empty event.
-    local timer = os.startTimer(SPEAKER_PING_TIMEOUT)
-
-    while pendingCount > 0 do
-        local event, p1 = os.pullEvent()
-
-        if event == "speaker_audio_empty" then
-            if p1 == nil then
-                -- If this CC/mod version does not include names, mark remaining as UNKNOWN.
-                for name, stillPending in pairs(pendingByName) do
-                    if stillPending then
-                        updateRow(rows, name, "UNKNOWN", "empty event unnamed")
-                    end
-                end
-
-                pendingCount = 0
-                break
-            end
-
-            local name = tostring(p1)
-
-            if pendingByName[name] then
-                pendingByName[name] = nil
-                pendingCount = pendingCount - 1
-                updateRow(rows, name, "PASS", "accepted + drained")
-                renderSpeakerReport("SPEAKER PING REPORT", rows, "Receiving responses. " .. reportSummary(rows))
-            end
-        elseif event == "timer" and p1 == timer then
-            for name, stillPending in pairs(pendingByName) do
-                if stillPending then
-                    updateRow(rows, name, "FAIL", "timeout/no empty event")
-                end
-            end
-
-            pendingCount = 0
-            break
-        elseif event == "peripheral" or event == "peripheral_detach" then
-            -- Network changed during the test; mark anything pending unknown.
-            for name, stillPending in pairs(pendingByName) do
-                if stillPending then
-                    updateRow(rows, name, "UNKNOWN", "network changed")
-                end
-            end
-
-            pendingCount = 0
-            break
-        end
-    end
-
-    local pass, fail, unknown, pending = countStatuses(rows)
-    local ok = fail == 0 and unknown == 0 and pending == 0
-
-    renderSpeakerReport("SPEAKER PING FINAL", rows, reportSummary(rows))
-
-    if ok then
-        bothPrint("RESULT: OK - every speaker accepted and drained.")
-    else
-        bothPrint("RESULT: NOT CLEAN - see FAIL/UNKNOWN rows above.")
-    end
-
-    return ok, rows
-end
-
-local function speakerPingDebug()
-    speakerPingReport("manual diagnostic")
-end
-
-
-
-local function speakerAudibleReport()
-    scanSpeakers()
-
-    local rows = makeSpeakerRows()
-    renderSpeakerReport("SPEAKER AUDIBLE TEST", rows, "Sending loud chime sequence to each listed speaker.")
-
-    for _, item in ipairs(citySpeakers) do
-        local name = tostring(item.name)
-        local ok, err = pcall(function()
-            item.speaker.stop()
-            sleep(0.05)
-            item.speaker.playSound("minecraft:block.note_block.chime", 1, 0.7)
-            sleep(0.15)
-            item.speaker.playSound("minecraft:block.note_block.chime", 1, 1.2)
-            sleep(0.15)
-            item.speaker.playSound("minecraft:block.note_block.bell", 1, 1.0)
-        end)
-
-        if ok then
-            updateRow(rows, name, "UNKNOWN", "command sent; must hear locally")
-        else
-            updateRow(rows, name, "FAIL", "sound error: " .. tostring(err):sub(1, 24))
-        end
-
-        renderSpeakerReport("SPEAKER AUDIBLE TEST", rows, reportSummary(rows))
-        sleep(0.3)
-    end
-
-    renderSpeakerReport("SPEAKER AUDIBLE FINAL", rows, reportSummary(rows))
-    bothPrint("NOTE: UNKNOWN means CC accepted the command, but it cannot prove a player heard it.")
-end
-
-local function disableSpeakerCommand(ref)
-    scanSpeakers()
-
-    local item, err = resolveSpeakerRef(ref)
-    if not item then
-        print(err)
-        return
-    end
-
-    local ok, msg = setSpeakerDisabled(item.name, true)
-
-    if ok then
-        print("Disabled speaker: " .. tostring(item.name))
-        print("JARVIS will skip it for TTS/music/testspk.")
-    else
-        print("Could not disable speaker: " .. tostring(msg))
-    end
-
-    scanSpeakers()
-end
-
-local function enableSpeakerCommand(ref)
-    scanSpeakers()
-
-    local item, err = resolveSpeakerRef(ref)
-    if not item then
-        print(err)
-        return
-    end
-
-    local ok, msg = setSpeakerDisabled(item.name, false)
-
-    if ok then
-        print("Enabled speaker: " .. tostring(item.name))
-    else
-        print("Could not enable speaker: " .. tostring(msg))
-    end
-
-    scanSpeakers()
 end
 
 -- =============================================================================
@@ -1860,15 +975,12 @@ local function requestMusic(track)
         return false
     end
 
-    resetAudioNetwork("music request")
-
     musicState.stop = false
     musicState.playing = true
     musicState.token = musicState.token + 1
     musicState.current = track
 
     print("[MUSIC] Queued: " .. tostring(track.name))
-    print("[MUSIC] Target speakers: " .. tostring(activeSpeakerCount()) .. "/" .. tostring(speakerCount()))
     os.queueEvent("jarvis_music_wake")
     return true
 end
@@ -1899,11 +1011,7 @@ local function musicLoop()
             local track = musicState.current
             local token = musicState.token
 
-            resetAudioNetwork("music stream start")
-            scanSpeakers()
             print("[MUSIC] Opening stream: " .. tostring(track.name))
-            print("[MUSIC] Broadcasting to " .. tostring(activeSpeakerCount()) .. "/" .. tostring(speakerCount()) .. " visible speaker(s).")
-            preflightSpeakers("music", true)
 
             local handle = http.get(track.url, {
                 ["User-Agent"] = "CC-Tweaked-JARVIS-Music",
@@ -1948,14 +1056,6 @@ local function musicLoop()
                     if not played and playErr ~= "cancelled" then
                         error(playErr or "speaker playback failed")
                     end
-
-                    local synced, syncErr = lockstepDrainAfterChunk("music chunk " .. tostring(chunks), false, function()
-                        return musicState.playing and not musicState.stop and token == musicState.token
-                    end)
-
-                    if not synced and syncErr == "cancelled" then
-                        break
-                    end
                 end
 
                 print("[MUSIC] Finished/ended. Chunks=" .. tostring(chunks) .. " Bytes=" .. tostring(bytes))
@@ -1999,31 +1099,6 @@ local function cleanSpeechText(text)
     return text
 end
 
-local function utf8SafeCutByte(str, maxBytes)
-    if #str <= maxBytes then return #str end
-
-    local cut = maxBytes
-
-    -- Move left until the next byte begins a new UTF-8 character.
-    while cut > 1 do
-        local nextByte = str:byte(cut + 1)
-
-        if not nextByte then
-            break
-        end
-
-        -- UTF-8 continuation bytes are 128-191.
-        if nextByte < 128 or nextByte >= 192 then
-            break
-        end
-
-        cut = cut - 1
-    end
-
-    if cut < 1 then cut = maxBytes end
-    return cut
-end
-
 local function splitSpeechChunks(text)
     local cleaned = cleanSpeechText(text)
     local chunks = {}
@@ -2031,18 +1106,20 @@ local function splitSpeechChunks(text)
     if cleaned == "" or cleaned == "nil" then return chunks end
 
     while #cleaned > TTS_SINGLE_REQUEST_MAX_CHARS do
-        local safeMax = utf8SafeCutByte(cleaned, TTS_SINGLE_REQUEST_MAX_CHARS)
-        local head = cleaned:sub(1, safeMax)
+        local head = cleaned:sub(1, TTS_SINGLE_REQUEST_MAX_CHARS)
         local cut = nil
 
-        -- Prefer sentence boundaries. Includes English and Chinese punctuation.
-        local boundary = head:match("^(.*[%.%!%?%;%:%。%！%？%；%：])")
-        if boundary and #boundary >= 120 then
-            cut = #boundary
+        -- Prefer sentence boundaries.
+        for i = #head, 1, -1 do
+            local ch = head:sub(i, i)
+            if ch == "." or ch == "!" or ch == "?" or ch == ";" or ch == ":" then
+                cut = i
+                break
+            end
         end
 
         -- Fallback to the last space.
-        if not cut then
+        if not cut or cut < 120 then
             for i = #head, 1, -1 do
                 if head:sub(i, i) == " " then
                     cut = i
@@ -2051,10 +1128,7 @@ local function splitSpeechChunks(text)
             end
         end
 
-        if not cut or cut < 80 then cut = #head end
-
-        -- Ensure the chosen cut does not split a UTF-8 character.
-        cut = utf8SafeCutByte(cleaned, cut)
+        if not cut or cut < 80 then cut = TTS_SINGLE_REQUEST_MAX_CHARS end
 
         local chunk = trim(cleaned:sub(1, cut))
         if chunk ~= "" then chunks[#chunks + 1] = chunk end
@@ -2186,11 +1260,6 @@ local function speakOneChunkOpenAI(cleaned, debug, chunkIndex, chunkCount, ttsIn
                 if not played then
                     error(playErr or "Speaker playback failed.")
                 end
-
-                local synced, syncErr = lockstepDrainAfterChunk("TTS PCM chunk " .. tostring(chunks), debug, nil)
-                if not synced and syncErr == "cancelled" then
-                    error("TTS cancelled during lockstep drain.")
-                end
             end
         end
 
@@ -2249,12 +1318,6 @@ local function speakOneChunkLegacy(cleaned, debug, chunkIndex, chunkCount)
                 response.close()
                 error(playErr or "Speaker playback failed.")
             end
-
-            local synced, syncErr = lockstepDrainAfterChunk("legacy TTS chunk " .. tostring(chunks), debug, nil)
-            if not synced and syncErr == "cancelled" then
-                response.close()
-                error("Legacy TTS cancelled during lockstep drain.")
-            end
         end
 
         response.close()
@@ -2296,13 +1359,11 @@ local function speakToCity(text, debug, ttsInstructions)
 
     scanSpeakers()
 
-    if debug then print("[TTS] Speakers visible: " .. tostring(#citySpeakers) .. " | targeted: " .. tostring(activeSpeakerCount()) .. " | force-all=" .. boolText(FORCE_ALL_VISIBLE_SPEAKERS)) end
-    if activeSpeakerCount() == 0 then return false, "No active speaker peripherals." end
+    if debug then print("[TTS] Speakers visible: " .. tostring(#citySpeakers)) end
+    if #citySpeakers == 0 then return false, "No visible speaker peripherals." end
 
     local chunks = splitSpeechChunks(text)
     if #chunks == 0 then return false, "Nothing to speak." end
-
-    preflightSpeakers("TTS", debug)
 
     if debug then
         local total = 0
@@ -2315,17 +1376,6 @@ local function speakToCity(text, debug, ttsInstructions)
         local ok, err = speakOneChunkToCity(chunk, debug, i, #chunks, ttsInstructions)
         if not ok then return false, err end
         if i < #chunks then sleep(0.12) end
-    end
-
-    local drained, drainErr = waitForTargetSpeakersEmpty("TTS final", AUDIO_DRAIN_TIMEOUT, debug, nil)
-
-    if not drained then
-        if debug then
-            print("[TTS] Drain warning: " .. tostring(drainErr))
-            print("[TTS] Forcing speaker reset after TTS.")
-        end
-
-        hardStopAllSpeakers("TTS drain recovery", debug)
     end
 
     return true, "spoken"
@@ -2356,17 +1406,14 @@ local function ttsDebug()
     print("OpenAI model: " .. tostring(OPENAI_TTS_MODEL))
     print("OpenAI voice: " .. tostring(OPENAI_TTS_VOICE))
     print("OpenAI format: " .. tostring(OPENAI_TTS_RESPONSE_FORMAT))
-    print("Morning style: angry Mandarin")
     print("HTTP API: " .. boolText(http and http.get and http.post))
     print("Legacy fallback: " .. boolText(LEGACY_TTS_FALLBACK_ENABLED))
     print("")
 
     scanSpeakers()
     print("Speakers visible: " .. tostring(#citySpeakers))
-    print("Speakers active: " .. tostring(activeSpeakerCount()))
     for i, item in ipairs(citySpeakers) do
-        local status = (isSpeakerDisabled(item.name) and not FORCE_ALL_VISIBLE_SPEAKERS) and "DISABLED" or "active"
-        print(tostring(i) .. ". " .. tostring(item.name) .. " [" .. status .. "] playAudio=" .. boolText(item.speaker and item.speaker.playAudio))
+        print(tostring(i) .. ". " .. tostring(item.name) .. " playAudio=" .. boolText(item.speaker and item.speaker.playAudio))
     end
 
     print("")
@@ -2537,13 +1584,11 @@ local function hasLatinLetters(text)
 end
 
 local function roughCjkByteCount(text)
-    text = tostring(text or "")
     local count = 0
+    text = tostring(text or "")
 
     for i = 1, #text do
         local b = text:byte(i)
-
-        -- Most common CJK UTF-8 leading bytes land here.
         if b and b >= 0xE4 and b <= 0xE9 then
             count = count + 1
         end
@@ -2554,70 +1599,10 @@ end
 
 local function looksLikeMandarinBroadcast(text)
     text = trim(text or "")
-
     if text == "" then return false end
     if hasLatinLetters(text) then return false end
     if roughCjkByteCount(text) < 18 then return false end
-
     return true
-end
-
-local function forceMandarinMorningText(original, clock)
-    original = trim(original or "")
-
-    if looksLikeMandarinBroadcast(original) then
-        return original, nil
-    end
-
-    local fixerSystem = [=[
-You are a strict language repair filter for JARVIS.
-
-Convert the supplied text into the final morning broadcast.
-
-Rules:
-- Output Simplified Chinese Mandarin only.
-- No English letters.
-- No pinyin.
-- No translation notes.
-- No bullet points.
-- No explanations.
-- No markdown.
-- Do not mention that you are converting or repairing text.
-- Keep the same fictional Ako Dynasty meaning, but make it angry, severe, official, commanding, and suitable for city-wide public speakers.
-- Mention 阿科王朝.
-- Mention 赤黑旗帜 or 赤黑.
-- Introduce the daily patriotic music programme near the end.
-- 120 to 220 Chinese characters.
-- Return only the final broadcast.
-]=]
-
-    local prompt = table.concat({
-        "Repair this failed morning broadcast.",
-        "Minecraft date: " .. tostring(clock and clock.date_text or "?"),
-        "Minecraft time: " .. tostring(clock and clock.time_text or "?"),
-        "",
-        "FAILED TEXT:",
-        original
-    }, "\n")
-
-    local fixed, err = callOpenAI({
-        {
-            role = "user",
-            content = prompt
-        }
-    }, fixerSystem)
-
-    fixed = trim(fixed or "")
-
-    if fixed ~= "" and looksLikeMandarinBroadcast(fixed) then
-        return fixed, nil
-    end
-
-    if fixed ~= "" then
-        return nil, "Mandarin repair still failed validation. Repaired text was: " .. fixed
-    end
-
-    return nil, "Mandarin repair failed: " .. tostring(err)
 end
 
 local function fallbackMorningBroadcast(clock)
@@ -2640,19 +1625,17 @@ local function generateMorningBroadcast(clock, forced)
     local history = readMorningHistory()
 
     local morningSystem = [=[
-You are NOT chatting with the operator.
-You are generating the exact words to be spoken aloud by JARVIS over the public speakers.
+You are generating the exact morning broadcast text to be spoken by JARVIS over public speakers.
 
-CRITICAL LANGUAGE RULE:
-Return Simplified Chinese Mandarin only.
-No English.
-No pinyin.
-No translation.
-No bullet points.
-No explanations.
-No style checklist.
-No "How may I assist you".
-Return only the finished morning broadcast.
+LANGUAGE RULE:
+- Simplified Chinese Mandarin only.
+- No English.
+- No pinyin.
+- No translation.
+- No bullet points.
+- No markdown.
+- No JSON.
+- Return only the final broadcast.
 
 Broadcast identity:
 - Nation: 阿科王朝.
@@ -2662,14 +1645,9 @@ Broadcast identity:
 - Theme: East Asian dynastic state-radio aesthetic.
 
 Tone:
-- Angry.
-- Severe.
-- Commanding.
-- Official.
-- Disciplined.
-- Impatient with disorder.
-- Ceremonial, but not poetic softness.
-- It should sound like an enraged but controlled public announcer forcing the city into order.
+- Angry, severe, commanding, official, disciplined.
+- Controlled anger, not screaming, not cartoonish.
+- It should sound like a furious public announcer forcing the city into order.
 
 Content requirements:
 - Address the citizens directly.
@@ -2678,13 +1656,10 @@ Content requirements:
 - Demand order, production, loyalty, and discipline.
 - Introduce the daily patriotic music programme near the end.
 - 120 to 220 Chinese characters.
-- Use Simplified Chinese punctuation.
 
 Forbidden:
 - Any English letters.
 - Any real country, real regime, real political party, real leader, or real-world ideology.
-- Markdown.
-- JSON.
 
 Return only the broadcast text.
 ]=]
@@ -2697,7 +1672,6 @@ Return only the broadcast text.
         "Absolute Minecraft day: " .. tostring(clock.absolute_day),
         "Forced test: " .. tostring(forced == true),
         "Visible city speakers: " .. tostring(speakerCount()),
-        "Active city speakers: " .. tostring(activeSpeakerCount()),
         "",
         "Avoid repeating these previous broadcasts:",
         history ~= "" and history or "No previous broadcasts recorded.",
@@ -2720,13 +1694,11 @@ Return only the broadcast text.
         return fallbackMorningBroadcast(clock), "GPT morning generation returned empty text."
     end
 
-    local mandarin, fixErr = forceMandarinMorningText(reply, clock)
-
-    if mandarin then
-        return mandarin, nil
+    if not looksLikeMandarinBroadcast(reply) then
+        return fallbackMorningBroadcast(clock), "GPT returned non-Mandarin/English text, using Mandarin fallback."
     end
 
-    return fallbackMorningBroadcast(clock), "GPT morning generation was not valid Mandarin: " .. tostring(fixErr)
+    return reply, nil
 end
 
 local function printMorningBroadcast(forced)
@@ -2739,19 +1711,15 @@ local function printMorningBroadcast(forced)
     print("Leader: " .. LEADER_NAME)
     print("Colours: " .. STATE_COLOURS)
     print("Purpose: city-wide compliance and loyalty broadcast")
-    print("Language: angry Mandarin only")
     print("Visible speakers: " .. tostring(speakerCount()))
-    print("Active speakers: " .. tostring(activeSpeakerCount()))
     print("TTS: " .. (TTS_ENABLED and "enabled" or "disabled"))
     print("Date: " .. c.date_text .. "  Time: " .. c.time_text)
     print("")
 
     stopMusic("morning broadcast")
-    resetAudioNetwork("pre-morning TTS")
     playOnAllSpeakers("minecraft:block.note_block.chime", 1, 1.0)
     sleep(0.15)
     playOnAllSpeakers("minecraft:block.note_block.chime", 1, 1.25)
-    sleep(0.35)
 
     print("Composing fresh public broadcast...")
     local speech, err = generateMorningBroadcast(c, forced)
@@ -2771,9 +1739,6 @@ local function printMorningBroadcast(forced)
     end
 
     print("")
-    print("Draining and resetting speaker buffers before music fanout...")
-    waitForTargetSpeakersEmpty("morning TTS before music", AUDIO_DRAIN_TIMEOUT, true, nil)
-    resetAudioNetwork("pre-music")
     print("Selecting daily patriotic music through JARVIS...")
     playRandomMusic()
 
@@ -2841,18 +1806,15 @@ local function bootScreen()
     print("Version: " .. VERSION)
     print("Model: " .. MODEL)
     print("")
-    print("Mode: HARD angry Mandarin morning broadcast + OpenAI TTS + integrated music")
+    print("Mode: English chat + angry Mandarin morning + OpenAI TTS + monitor mirror")
     print("Nation: " .. NATION_NAME)
     print("Leader: " .. LEADER_NAME)
     print("Colours: " .. STATE_COLOURS)
     print("Theme: " .. CULTURAL_THEME)
     print("")
     print("Wired speaker peripherals visible: " .. tostring(speakerCount()))
-    print("Wired speaker peripherals targeted: " .. tostring(activeSpeakerCount()))
     print("TTS: " .. (TTS_ENABLED and "enabled" or "disabled"))
     print("Music tracks loaded: " .. tostring(#musicTracks))
-    print("Speaker ping/lockstep: " .. boolText(AUDIO_LOCKSTEP_MODE))
-    print("Report monitor: " .. tostring(reportMonName or "none"))
     print("")
     print("Commands:")
     print("  exit        - close JARVIS")
@@ -2862,27 +1824,16 @@ local function bootScreen()
     print("  morning     - force fresh GPT city broadcast")
     print("  speakers    - rescan/list visible speakers")
     print("  peripherals - list every visible peripheral")
-    print("  testspk     - play test chime on active speakers")
-    print("  testeach    - test every speaker one by one")
-    print("  spfanout    - test raw audio fanout to all visible speakers")
-    print("  spreset     - hard reset/clear every speaker buffer")
-    print("  spping      - report PASS/FAIL for every speaker")
-    print("  sphear      - audible command test report")
-    print("  spbase      - save current speaker map")
-    print("  spdiff      - compare current speakers to saved map")
-    print("  spoffmiss   - disable speakers missing from saved map")
-    print("  spoff 3     - disable/mute visible speaker number 3")
-    print("  spon 3      - re-enable visible speaker number 3")
-    print("  spoffname speaker_7 - disable by exact name")
-    print("  sponname speaker_7  - re-enable by exact name")
+    print("  monitors    - refresh/list monitor mirror")
+    print("  montest     - test monitor mirror")
+    print("  testspk     - play test chime on all speakers")
     print("  stopspk     - stop all speakers")
     print("  tts on      - enable TTS")
     print("  tts off     - disable TTS")
     print("  tts test    - speak test line")
     print("  tts debug   - full TTS diagnostic")
-    print("  tts mandarin- angry Mandarin voice test")
-    print("  version     - show active script version/update URL")
-    print("  update      - force GitHub self-update")
+    print("  tts mandarin- angry Mandarin TTS test")
+    print("  version     - show active version")
     print("  voice cedar - change OpenAI voice")
     print("  voices      - list recommended voices")
     print("  tracks      - load/list approved music")
@@ -2933,58 +1884,22 @@ local function chatLoop()
             elseif lower == "peripherals" then
                 printAllPeripherals()
 
+            elseif lower == "monitors" or lower == "monitor" then
+                refreshMonitorMirror()
+
+            elseif lower == "montest" or lower == "mon test" then
+                monitorMirrorTest()
+
+            elseif lower == "version" then
+                print("JARVIS version: " .. tostring(VERSION))
+                print("Update URL: " .. tostring(UPDATE_URL))
+                print("Normal chat language: English")
+                print("Morning broadcast language: angry Mandarin only")
+                print("TTS provider: " .. tostring(TTS_PROVIDER))
+                print("OpenAI TTS voice: " .. tostring(OPENAI_TTS_VOICE))
+
             elseif lower == "testspk" then
                 testSpeakers()
-
-            elseif lower == "testeach" or lower == "testallspk" then
-                testEachSpeaker()
-
-            elseif lower == "spfanout" or lower == "speakerfanout" then
-                speakerFanoutDebug()
-
-            elseif lower == "spreset" or lower == "speakerreset" or lower == "audioreset" then
-                speakerDrainDebug()
-
-            elseif lower == "spping" or lower == "speakerping" or lower == "ping speakers" then
-                speakerPingDebug()
-
-            elseif lower == "sphear" or lower == "sptesthear" or lower == "speakeraudible" then
-                speakerAudibleReport()
-
-            elseif lower == "spbase" or lower == "speakerbase" or lower == "speaker baseline" then
-                saveSpeakerBaseline()
-
-            elseif lower == "spdiff" or lower == "speakerdiff" or lower == "speaker diff" then
-                diffSpeakerBaseline()
-
-            elseif lower == "spoffmiss" or lower == "spoffmissing" or lower == "disablemissing" then
-                disableMissingFromBaseline()
-
-            elseif lower:match("^spoffname%s+") or lower:match("^disable%s+speakername%s+") then
-                local ref =
-                    input:match("^spoffname%s+(.+)$") or
-                    input:match("^disable%s+speakername%s+(.+)$")
-                disableSpeakerNameCommand(ref)
-
-            elseif lower:match("^sponname%s+") or lower:match("^enable%s+speakername%s+") then
-                local ref =
-                    input:match("^sponname%s+(.+)$") or
-                    input:match("^enable%s+speakername%s+(.+)$")
-                enableSpeakerNameCommand(ref)
-
-            elseif lower:match("^spoff%s+") or lower:match("^speaker%s+off%s+") or lower:match("^disable%s+speaker%s+") then
-                local ref =
-                    lower:match("^spoff%s+(.+)$") or
-                    lower:match("^speaker%s+off%s+(.+)$") or
-                    lower:match("^disable%s+speaker%s+(.+)$")
-                disableSpeakerCommand(ref)
-
-            elseif lower:match("^spon%s+") or lower:match("^speaker%s+on%s+") or lower:match("^enable%s+speaker%s+") then
-                local ref =
-                    lower:match("^spon%s+(.+)$") or
-                    lower:match("^speaker%s+on%s+(.+)$") or
-                    lower:match("^enable%s+speaker%s+(.+)$")
-                enableSpeakerCommand(ref)
 
             elseif lower == "stopspk" then
                 stopAllSpeakers()
@@ -3010,36 +1925,14 @@ local function chatLoop()
                 local okSpeak, speakErr = speakToCity(sample, true, MORNING_TTS_INSTRUCTIONS)
                 if okSpeak then print("Angry Mandarin TTS test spoken.") else print("Mandarin TTS test failed: " .. tostring(speakErr)) end
 
-            elseif lower == "version" then
-                print("JARVIS version: " .. tostring(VERSION))
-                print("Update URL:")
-                print(UPDATE_URL)
-
-            elseif lower == "update" or lower == "selfupdate" then
-                print("Forcing GitHub self-update from:")
-                print(UPDATE_URL)
-                local result = selfUpdate(true)
-                if result == "updated" then
-                    return
-                else
-                    print("No update applied or update failed. Local copy kept.")
-                end
-
             elseif lower == "voices" then
                 print("OpenAI voices to try:")
-                print("  alloy")
-                print("  ash")
+                print("  cedar  - authoritative / polished")
+                print("  marin  - natural / high quality")
+                print("  onyx   - deep / serious")
                 print("  ballad - ceremonial / theatrical")
-                print("  coral")
-                print("  echo")
-                print("  fable")
-                print("  marin - natural / high quality")
-                print("  nova")
-                print("  onyx - deep / serious")
-                print("  sage")
-                print("  shimmer")
-                print("  verse - expressive")
-                print("  cedar - authoritative / polished")
+                print("  verse  - expressive")
+                print("  coral  - warmer")
                 print("Current voice: " .. tostring(OPENAI_TTS_VOICE))
 
             elseif lower:match("^voice%s+") then
@@ -3092,8 +1985,7 @@ end
 
 math.randomseed(os.epoch and os.epoch("utc") or math.floor(os.clock() * 100000))
 
-loadDisabledSpeakers()
-initReportMonitor()
+startMonitorMirror()
 
 print("Scanning wired speaker network...")
 local foundSpeakers = scanSpeakers()
