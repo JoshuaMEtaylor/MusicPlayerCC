@@ -31,7 +31,7 @@
 --   stopmusic
 -- =============================================================================
 
-local VERSION = "3.5.0-auto-monitor-fit"
+local VERSION = "3.6.0-real-audio-speaker-test"
 local args = {...}
 
 -- =============================================================================
@@ -1092,7 +1092,7 @@ local function speakerAudibleReportCommand()
 end
 
 local function testSpeakers()
-    speakerAudibleReportCommand()
+    speakerRealAudioReport("SPEAKER REAL AUDIO PASS/FAIL REPORT", 0.45)
 end
 
 -- =============================================================================
