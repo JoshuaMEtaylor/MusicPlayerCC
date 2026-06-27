@@ -358,261 +358,6 @@ local function monitorMirrorTest()
 end
 
 
--- =============================================================================
--- SPEAKER PASS / FAIL REPORTING
--- =============================================================================
-
-local function reportLine(textLine)
-    print(tostring(textLine or ""))
-end
-
-local function reportHeader(title)
-    print("")
-    print("============================================================")
-    print(title)
-    print("============================================================")
-end
-
-local function makeReportRows()
-    scanSpeakers()
-
-    local rows = {}
-
-    for i, item in ipairs(citySpeakers) do
-        rows[#rows + 1] = {
-            index = i,
-            name = tostring(item.name),
-            status = "PENDING",
-            details = "waiting",
-        }
-    end
-
-    return rows
-end
-
-local function updateReportRow(rows, name, status, details)
-    for _, row in ipairs(rows) do
-        if tostring(row.name) == tostring(name) then
-            row.status = status or row.status
-            row.details = details or row.details
-            return true
-        end
-    end
-
-    return false
-end
-
-local function reportCounts(rows)
-    local pass, fail, unknown, pending = 0, 0, 0, 0
-
-    for _, row in ipairs(rows or {}) do
-        if row.status == "PASS" then
-            pass = pass + 1
-        elseif row.status == "FAIL" then
-            fail = fail + 1
-        elseif row.status == "UNKNOWN" then
-            unknown = unknown + 1
-        else
-            pending = pending + 1
-        end
-    end
-
-    return pass, fail, unknown, pending
-end
-
-local function reportSummaryText(rows)
-    local pass, fail, unknown, pending = reportCounts(rows)
-
-    return "SUMMARY: PASS=" .. tostring(pass) ..
-        " FAIL=" .. tostring(fail) ..
-        " UNKNOWN=" .. tostring(unknown) ..
-        " PENDING=" .. tostring(pending)
-end
-
-local function printReportTable(title, rows, note)
-    reportHeader(title)
-
-    if note and note ~= "" then
-        reportLine(note)
-        reportLine("")
-    end
-
-    reportLine(reportSummaryText(rows))
-    reportLine("")
-    reportLine("No  Speaker              Status    Details")
-    reportLine("--  -------------------  --------  -----------------------------")
-
-    for _, row in ipairs(rows or {}) do
-        local n = tostring(row.index or "?")
-        if #n < 2 then n = " " .. n end
-
-        local name = tostring(row.name or "?")
-        if #name > 19 then name = name:sub(1, 19) end
-        while #name < 19 do name = name .. " " end
-
-        local status = tostring(row.status or "PENDING")
-        while #status < 8 do status = status .. " " end
-
-        local details = tostring(row.details or "")
-        if #details > 29 then details = details:sub(1, 29) end
-
-        reportLine(n .. "  " .. name .. "  " .. status .. "  " .. details)
-    end
-
-    reportLine("============================================================")
-    reportLine("")
-end
-
-local function makeSilentProbeBuffer()
-    local buffer = {}
-
-    for i = 1, 4096 do
-        buffer[i] = 0
-    end
-
-    return buffer
-end
-
-local function speakerPassFailReport(title, audible)
-    scanSpeakers()
-
-    local rows = makeReportRows()
-
-    if #rows == 0 then
-        printReportTable(title or "SPEAKER TEST REPORT", rows, "No speakers are visible.")
-        return false, rows
-    end
-
-    printReportTable(title or "SPEAKER TEST REPORT", rows, "Starting speaker test...")
-
-    hardStopAllSpeakers("speaker test", false)
-    sleep(0.2)
-
-    local pending = {}
-    local pendingCount = 0
-    local probe = makeSilentProbeBuffer()
-
-    for _, row in ipairs(rows) do
-        pending[row.name] = true
-        pendingCount = pendingCount + 1
-    end
-
-    for _, item in ipairs(citySpeakers) do
-        local name = tostring(item.name)
-
-        local ok, accepted
-
-        if audible then
-            ok, accepted = pcall(function()
-                item.speaker.stop()
-                item.speaker.playSound("minecraft:block.note_block.chime", 1, 1.2)
-                -- Also send a silent audio buffer so we get an empty event for PASS/FAIL.
-                return item.speaker.playAudio(probe, 1)
-            end)
-        else
-            ok, accepted = pcall(function()
-                return item.speaker.playAudio(probe, 1)
-            end)
-        end
-
-        if ok and accepted then
-            updateReportRow(rows, name, "UNKNOWN", "accepted; waiting empty")
-        elseif ok and not accepted then
-            updateReportRow(rows, name, "FAIL", "rejected/buffer full")
-            if pending[name] then
-                pending[name] = nil
-                pendingCount = pendingCount - 1
-            end
-        else
-            updateReportRow(rows, name, "FAIL", "error: " .. tostring(accepted))
-            if pending[name] then
-                pending[name] = nil
-                pendingCount = pendingCount - 1
-            end
-        end
-    end
-
-    printReportTable(title or "SPEAKER TEST REPORT", rows, "Commands sent. Waiting for speaker_audio_empty replies...")
-
-    local timer = os.startTimer(SPEAKER_TEST_TIMEOUT)
-
-    while pendingCount > 0 do
-        local event, p1 = os.pullEvent()
-
-        if event == "speaker_audio_empty" then
-            if p1 == nil then
-                -- If this version/mod does not give speaker names, we cannot map exact PASS.
-                for name, stillPending in pairs(pending) do
-                    if stillPending then
-                        updateReportRow(rows, name, "UNKNOWN", "empty event unnamed")
-                    end
-                end
-                pendingCount = 0
-                break
-            end
-
-            local name = tostring(p1)
-
-            if pending[name] then
-                pending[name] = nil
-                pendingCount = pendingCount - 1
-                updateReportRow(rows, name, "PASS", "accepted + drained")
-            end
-        elseif event == "timer" and p1 == timer then
-            for name, stillPending in pairs(pending) do
-                if stillPending then
-                    updateReportRow(rows, name, "FAIL", "timeout/no drain event")
-                end
-            end
-            pendingCount = 0
-            break
-        elseif event == "peripheral" or event == "peripheral_detach" then
-            for name, stillPending in pairs(pending) do
-                if stillPending then
-                    updateReportRow(rows, name, "UNKNOWN", "network changed")
-                end
-            end
-            pendingCount = 0
-            break
-        end
-    end
-
-    local pass, fail, unknown, pend = reportCounts(rows)
-    local ok = fail == 0 and unknown == 0 and pend == 0
-
-    printReportTable(title or "SPEAKER TEST FINAL REPORT", rows, ok and "RESULT: CLEAN PASS" or "RESULT: NOT CLEAN - see table")
-
-    return ok, rows
-end
-
-local function speakerPingReportCommand()
-    return speakerPassFailReport("SPEAKER PING PASS/FAIL REPORT", false)
-end
-
-local function speakerAudibleReportCommand()
-    print("Audible test: it will chime, but PASS/FAIL is based on CC buffer response.")
-    return speakerPassFailReport("SPEAKER AUDIBLE PASS/FAIL REPORT", true)
-end
-
-
-print = function(...)
-    nativePrint(...)
-
-    local args = {...}
-    local out = {}
-
-    for i = 1, #args do
-        out[#out + 1] = tostring(args[i])
-    end
-
-    mirrorWriteRaw(table.concat(out, "\t") .. "\n")
-end
-
-write = function(value)
-    nativeWrite(value)
-    mirrorWriteRaw(tostring(value or ""))
-end
-
 local function encodePath(path)
     return tostring(path):gsub("([^%w%-%._~/])", function(c)
         return string.format("%%%02X", string.byte(c))
@@ -1082,6 +827,232 @@ local function stopAllSpeakers()
     end
 
     print("Stopped " .. tostring(count) .. " speaker(s).")
+end
+
+
+-- =============================================================================
+-- SPEAKER PASS / FAIL REPORTING
+-- =============================================================================
+
+local function reportHeader(title)
+    print("")
+    print("============================================================")
+    print(tostring(title or "SPEAKER REPORT"))
+    print("============================================================")
+end
+
+local function makeSilentProbeBuffer()
+    local buffer = {}
+    for i = 1, 4096 do
+        buffer[i] = 0
+    end
+    return buffer
+end
+
+local function makeReportRows()
+    scanSpeakers()
+
+    local rows = {}
+    for i, item in ipairs(citySpeakers) do
+        rows[#rows + 1] = {
+            index = i,
+            name = tostring(item.name),
+            status = "PENDING",
+            details = "waiting",
+        }
+    end
+    return rows
+end
+
+local function updateReportRow(rows, name, status, details)
+    for _, row in ipairs(rows or {}) do
+        if tostring(row.name) == tostring(name) then
+            row.status = status or row.status
+            row.details = details or row.details
+            return true
+        end
+    end
+    return false
+end
+
+local function reportCounts(rows)
+    local pass, fail, unknown, pending = 0, 0, 0, 0
+
+    for _, row in ipairs(rows or {}) do
+        if row.status == "PASS" then pass = pass + 1
+        elseif row.status == "FAIL" then fail = fail + 1
+        elseif row.status == "UNKNOWN" then unknown = unknown + 1
+        else pending = pending + 1 end
+    end
+
+    return pass, fail, unknown, pending
+end
+
+local function reportSummaryText(rows)
+    local pass, fail, unknown, pending = reportCounts(rows)
+    return "SUMMARY: PASS=" .. tostring(pass) ..
+        " FAIL=" .. tostring(fail) ..
+        " UNKNOWN=" .. tostring(unknown) ..
+        " PENDING=" .. tostring(pending)
+end
+
+local function printReportTable(title, rows, note)
+    reportHeader(title)
+
+    if note and note ~= "" then
+        print(tostring(note))
+        print("")
+    end
+
+    print(reportSummaryText(rows))
+    print("")
+    print("No  Speaker              Status    Details")
+    print("--  -------------------  --------  -----------------------------")
+
+    for _, row in ipairs(rows or {}) do
+        local n = tostring(row.index or "?")
+        if #n < 2 then n = " " .. n end
+
+        local name = tostring(row.name or "?")
+        if #name > 19 then name = name:sub(1, 19) end
+        while #name < 19 do name = name .. " " end
+
+        local status = tostring(row.status or "PENDING")
+        while #status < 8 do status = status .. " " end
+
+        local details = tostring(row.details or "")
+        if #details > 29 then details = details:sub(1, 29) end
+
+        print(n .. "  " .. name .. "  " .. status .. "  " .. details)
+    end
+
+    print("============================================================")
+    print("")
+end
+
+local function speakerPassFailReport(title, audible)
+    local rows = makeReportRows()
+
+    if #rows == 0 then
+        printReportTable(title or "SPEAKER TEST REPORT", rows, "No speakers are visible.")
+        return false, rows
+    end
+
+    printReportTable(title or "SPEAKER TEST REPORT", rows, "Starting speaker test...")
+
+    -- Clear all current speaker buffers first.
+    for _, item in ipairs(citySpeakers) do
+        pcall(function()
+            item.speaker.stop()
+        end)
+    end
+
+    sleep(0.2)
+
+    local pending = {}
+    local pendingCount = 0
+    local probe = makeSilentProbeBuffer()
+
+    for _, row in ipairs(rows) do
+        pending[row.name] = true
+        pendingCount = pendingCount + 1
+    end
+
+    for _, item in ipairs(citySpeakers) do
+        local name = tostring(item.name)
+        local ok, accepted
+
+        if audible then
+            ok, accepted = pcall(function()
+                item.speaker.stop()
+                item.speaker.playSound("minecraft:block.note_block.chime", 1, 1.2)
+                sleep(0.05)
+                return item.speaker.playAudio(probe, 1)
+            end)
+        else
+            ok, accepted = pcall(function()
+                return item.speaker.playAudio(probe, 1)
+            end)
+        end
+
+        if ok and accepted then
+            updateReportRow(rows, name, "UNKNOWN", "accepted; waiting empty")
+        elseif ok and not accepted then
+            updateReportRow(rows, name, "FAIL", "rejected/buffer full")
+            if pending[name] then
+                pending[name] = nil
+                pendingCount = pendingCount - 1
+            end
+        else
+            updateReportRow(rows, name, "FAIL", "error: " .. tostring(accepted))
+            if pending[name] then
+                pending[name] = nil
+                pendingCount = pendingCount - 1
+            end
+        end
+    end
+
+    printReportTable(title or "SPEAKER TEST REPORT", rows, "Commands sent. Waiting for speaker_audio_empty replies...")
+
+    local timer = os.startTimer(SPEAKER_TEST_TIMEOUT or 8)
+
+    while pendingCount > 0 do
+        local event, p1 = os.pullEvent()
+
+        if event == "speaker_audio_empty" then
+            if p1 == nil then
+                for name, stillPending in pairs(pending) do
+                    if stillPending then
+                        updateReportRow(rows, name, "UNKNOWN", "empty event unnamed")
+                    end
+                end
+                pendingCount = 0
+                break
+            end
+
+            local name = tostring(p1)
+
+            if pending[name] then
+                pending[name] = nil
+                pendingCount = pendingCount - 1
+                updateReportRow(rows, name, "PASS", "accepted + drained")
+            end
+
+        elseif event == "timer" and p1 == timer then
+            for name, stillPending in pairs(pending) do
+                if stillPending then
+                    updateReportRow(rows, name, "FAIL", "timeout/no drain event")
+                end
+            end
+            pendingCount = 0
+            break
+
+        elseif event == "peripheral" or event == "peripheral_detach" then
+            for name, stillPending in pairs(pending) do
+                if stillPending then
+                    updateReportRow(rows, name, "UNKNOWN", "network changed")
+                end
+            end
+            pendingCount = 0
+            break
+        end
+    end
+
+    local pass, fail, unknown, pend = reportCounts(rows)
+    local clean = fail == 0 and unknown == 0 and pend == 0
+
+    printReportTable(title or "SPEAKER TEST FINAL REPORT", rows, clean and "RESULT: CLEAN PASS" or "RESULT: NOT CLEAN - see FAIL/UNKNOWN rows")
+
+    return clean, rows
+end
+
+local function speakerPingReportCommand()
+    return speakerPassFailReport("SPEAKER PING PASS/FAIL REPORT", false)
+end
+
+local function speakerAudibleReportCommand()
+    print("Audible test: it will chime, but PASS/FAIL is based on CC buffer response.")
+    return speakerPassFailReport("SPEAKER AUDIBLE PASS/FAIL REPORT", true)
 end
 
 local function testSpeakers()
@@ -1568,6 +1539,200 @@ local function minecraftClock()
     }
 end
 
+
+-- =============================================================================
+-- INTEGRATED MUSIC STREAMING
+-- =============================================================================
+
+local musicTracks = {}
+
+local function makeTrackUrl(fileName)
+    return MUSIC_RAW_BASE .. encodePath(fileName)
+end
+
+local function loadTracksFromGitHub()
+    if not http or not http.get then
+        return false, "HTTP unavailable."
+    end
+
+    print("[MUSIC] Loading track list from GitHub...")
+
+    local handle = http.get(MUSIC_API_URL, {
+        ["User-Agent"] = "CC-Tweaked-JARVIS-Music",
+        ["Accept"] = "application/vnd.github+json",
+    })
+
+    if not handle then
+        return false, "Could not contact GitHub contents API."
+    end
+
+    local code = "?"
+    if handle.getResponseCode then
+        local okCode, c = pcall(function() return handle.getResponseCode() end)
+        if okCode then code = tostring(c) end
+    end
+
+    local body = handle.readAll()
+    handle.close()
+
+    print("[MUSIC] GitHub API HTTP " .. tostring(code))
+
+    local data = textutils.unserializeJSON(body)
+    if type(data) ~= "table" then
+        return false, "Could not parse GitHub track list JSON."
+    end
+
+    local found = {}
+
+    for _, item in ipairs(data) do
+        if type(item) == "table" and item.type == "file" and type(item.name) == "string" then
+            if item.name:lower():match("%.dfpwm$") then
+                found[#found + 1] = {
+                    file = item.name,
+                    name = niceTrackName(item.name),
+                    size = tonumber(item.size) or 0,
+                    url = makeTrackUrl(item.name),
+                }
+            end
+        end
+    end
+
+    table.sort(found, function(a, b)
+        return tostring(a.name):lower() < tostring(b.name):lower()
+    end)
+
+    musicTracks = found
+
+    if #musicTracks == 0 then
+        return false, "No .dfpwm tracks found in repo root."
+    end
+
+    return true, #musicTracks
+end
+
+local function ensureTracks()
+    if #musicTracks > 0 then return true, #musicTracks end
+    return loadTracksFromGitHub()
+end
+
+local function printTracks()
+    local ok, result = ensureTracks()
+
+    print("")
+    line()
+    print("APPROVED MUSIC TRACKS")
+    print("Repo: " .. MUSIC_REPO_USER .. "/" .. MUSIC_REPO_NAME)
+    print("")
+
+    if not ok then
+        print("Failed: " .. tostring(result))
+    else
+        for i, track in ipairs(musicTracks) do
+            local sizeKb = track.size and math.floor(track.size / 1024) or 0
+            print(tostring(i) .. ". " .. tostring(track.name) .. " [" .. tostring(sizeKb) .. "KB]")
+        end
+    end
+
+    line()
+    print("")
+end
+
+local function playMusicTrack(track)
+    if not track then
+        print("[MUSIC] No track selected.")
+        return false
+    end
+
+    scanSpeakers()
+
+    if #citySpeakers == 0 then
+        print("[MUSIC] No speakers visible.")
+        return false
+    end
+
+    print("[MUSIC] Opening stream: " .. tostring(track.name))
+    print("[MUSIC] Broadcasting to " .. tostring(#citySpeakers) .. " visible speaker(s).")
+
+    local handle = http.get(track.url, {
+        ["User-Agent"] = "CC-Tweaked-JARVIS-Music",
+    }, true)
+
+    if not handle then
+        print("[MUSIC] Stream failed: no HTTP handle.")
+        return false
+    end
+
+    local code = "?"
+    if handle.getResponseCode then
+        local okCode, c = pcall(function() return handle.getResponseCode() end)
+        if okCode then code = tostring(c) end
+    end
+
+    print("[MUSIC] Stream HTTP " .. tostring(code))
+
+    local okPlay, errPlay = pcall(function()
+        local dfpwm = require("cc.audio.dfpwm")
+        local decoder = dfpwm.make_decoder()
+        local chunks = 0
+        local bytes = 0
+
+        while true do
+            local chunk = handle.read(MUSIC_CHUNK_SIZE or 16384)
+            if not chunk then break end
+
+            chunks = chunks + 1
+            bytes = bytes + #chunk
+
+            if chunks == 1 then
+                print("[MUSIC] First audio chunk: " .. tostring(#chunk) .. " bytes.")
+            end
+
+            local audio = decoder(chunk)
+            local played, playErr = playAudioBufferOnAll(audio, MUSIC_VOLUME or 1, false, nil)
+
+            if not played then
+                error(playErr or "speaker playback failed")
+            end
+        end
+
+        print("[MUSIC] Finished. Chunks=" .. tostring(chunks) .. " Bytes=" .. tostring(bytes))
+    end)
+
+    handle.close()
+
+    if not okPlay then
+        print("[MUSIC] Playback error: " .. tostring(errPlay))
+        return false
+    end
+
+    return true
+end
+
+local function playRandomMusic()
+    local ok, result = ensureTracks()
+
+    if not ok then
+        print("[MUSIC] Track load failed: " .. tostring(result))
+        return false
+    end
+
+    if #musicTracks == 0 then
+        print("[MUSIC] No tracks loaded.")
+        return false
+    end
+
+    local track = musicTracks[math.random(1, #musicTracks)]
+    print("Daily music selection: " .. tostring(track.name))
+    return playMusicTrack(track)
+end
+
+local function stopMusic(reason)
+    if reason then
+        print("[MUSIC] Stop: " .. tostring(reason))
+    end
+    stopAllSpeakers()
+end
+
 -- =============================================================================
 -- GPT MORNING TOWN BROADCAST
 -- =============================================================================
@@ -2012,7 +2177,7 @@ print("Speaker scan complete: " .. tostring(foundSpeakers) .. " speaker(s) visib
 sleep(0.5)
 
 local ok, err = pcall(function()
-    parallel.waitForAny(chatLoop, morningBroadcastLoop, musicLoop)
+    parallel.waitForAny(chatLoop, morningBroadcastLoop)
 end)
 
 if not ok then
