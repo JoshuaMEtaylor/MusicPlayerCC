@@ -31,7 +31,7 @@
 --   stopmusic
 -- =============================================================================
 
-local VERSION = "3.6.1-real-audio-test-checked"
+local VERSION = "3.7.0-ordered-speaker-broadcast"
 local args = {...}
 
 -- =============================================================================
@@ -56,6 +56,8 @@ local TTS_VOLUME = 1.0
 local TTS_SINGLE_REQUEST_MAX_CHARS = 600
 local TTS_TOTAL_MAX_CHARS = 2600
 local AUDIO_WAIT_TIMEOUT = 0.35
+local SPEAKER_ORDERED_SEND_TIMEOUT = 8
+local SPEAKER_ORDERED_MAX_RETRIES = 80
 local SPEAKER_TEST_TIMEOUT = 8
 local SPEAKER_AUDIBLE_TEST_HZ = 660
 local SPEAKER_AUDIBLE_TEST_VOLUME = 1.0
@@ -685,6 +687,13 @@ local function scanSpeakers()
     end
 
     table.sort(citySpeakers, function(a, b)
+        local an = tonumber(tostring(a.name):match("(%d+)$"))
+        local bn = tonumber(tostring(b.name):match("(%d+)$"))
+
+        if an and bn and an ~= bn then
+            return an < bn
+        end
+
         return tostring(a.name) < tostring(b.name)
     end)
 
@@ -718,10 +727,29 @@ local function printAllPeripherals()
     print("")
 end
 
+local function printSpeakerOrder()
+    scanSpeakers()
+
+    print("")
+    line()
+    print("ORDERED BROADCAST SPEAKER ORDER")
+    print("Each audio buffer is sent once to each speaker in this order.")
+    print("JARVIS waits/retries on the current speaker before moving to the next.")
+    print("")
+
+    for i, item in ipairs(citySpeakers) do
+        print(tostring(i) .. ". " .. tostring(item.name))
+    end
+
+    line()
+    print("")
+end
+
 local function printSpeakers()
     print("")
     line()
     print("WIRED CITY SPEAKER NETWORK")
+    print("Audio mode: ordered per-speaker broadcast")
     print("Detected speaker peripherals: " .. tostring(#citySpeakers))
     print("TTS: " .. (TTS_ENABLED and "enabled" or "disabled"))
     print("Music: " .. (MUSIC_VOLUME > 0 and "enabled" or "muted"))
@@ -754,8 +782,8 @@ local function rescanSpeakers()
     printSpeakers()
 end
 
-local function waitSpeakerEvent(shouldContinue)
-    local timer = os.startTimer(AUDIO_WAIT_TIMEOUT)
+local function waitForSpeakerEmpty(speakerName, timeoutSeconds, shouldContinue)
+    local timer = os.startTimer(timeoutSeconds or SPEAKER_ORDERED_SEND_TIMEOUT)
 
     while true do
         if shouldContinue and not shouldContinue() then
@@ -765,67 +793,93 @@ local function waitSpeakerEvent(shouldContinue)
         local event, p1 = os.pullEvent()
 
         if event == "speaker_audio_empty" then
-            return true
+            -- On normal CC:Tweaked this event includes the speaker peripheral name.
+            -- If a name is supplied, only wake for the speaker we are currently feeding.
+            -- If no name is supplied, wake anyway because older/modded builds may omit it.
+            if p1 == nil or tostring(p1) == tostring(speakerName) then
+                return true
+            end
+
         elseif event == "timer" and p1 == timer then
-            return true
+            return false, "timeout waiting for " .. tostring(speakerName)
+
+        elseif event == "peripheral_detach" then
+            return false, "peripheral detached while waiting for " .. tostring(speakerName)
         end
     end
 end
 
-local function playAudioBufferOnAll(buffer, volume, debug, shouldContinue)
-    if #citySpeakers == 0 then scanSpeakers() end
-
-    if #citySpeakers == 0 then
-        return false, "No visible speaker peripherals."
-    end
-
-    local pending = {}
-    for i = 1, #citySpeakers do pending[i] = true end
-
-    local attempts = 0
+local function playAudioBufferOnSpeaker(item, buffer, volume, debug, shouldContinue)
+    local name = tostring(item.name)
+    local retries = 0
 
     while true do
         if shouldContinue and not shouldContinue() then
             return false, "cancelled"
         end
 
-        attempts = attempts + 1
-        local remaining = 0
-        local hadError = false
+        retries = retries + 1
 
-        for i, item in ipairs(citySpeakers) do
-            if pending[i] then
-                local ok, accepted = pcall(function()
-                    return item.speaker.playAudio(buffer, volume or 1)
-                end)
+        local ok, accepted = pcall(function()
+            return item.speaker.playAudio(buffer, volume or 1)
+        end)
 
-                if ok and accepted then
-                    pending[i] = false
-                else
-                    remaining = remaining + 1
-                    if not ok then
-                        hadError = true
-                        if debug then
-                            print("playAudio error on " .. tostring(item.name) .. ": " .. tostring(accepted))
-                        end
-                    end
-                end
+        if ok and accepted then
+            if debug then
+                print("[AUDIO] " .. name .. " accepted buffer")
             end
-        end
 
-        if remaining == 0 then
             return true
         end
 
-        if hadError and attempts > 3 then
-            return false, "One or more speakers rejected audio buffers."
+        if not ok then
+            return false, "playAudio error on " .. name .. ": " .. tostring(accepted)
         end
 
-        local waited, waitErr = waitSpeakerEvent(shouldContinue)
+        if retries >= SPEAKER_ORDERED_MAX_RETRIES then
+            return false, "too many retries sending to " .. name
+        end
+
+        if debug then
+            print("[AUDIO] " .. name .. " buffer full; waiting")
+        end
+
+        local waited, waitErr = waitForSpeakerEmpty(name, SPEAKER_ORDERED_SEND_TIMEOUT, shouldContinue)
+
         if not waited then
             return false, waitErr
         end
     end
+end
+
+local function playAudioBufferOnAll(buffer, volume, debug, shouldContinue)
+    -- Ordered broadcast mode:
+    -- One chunk is sent to speaker_0, then speaker_1, then speaker_2, etc.
+    -- If a speaker is full, JARVIS waits for that exact speaker before retrying.
+    -- It does NOT spray every pending speaker repeatedly.
+    scanSpeakers()
+
+    if #citySpeakers == 0 then
+        return false, "No visible speaker peripherals."
+    end
+
+    if debug then
+        print("[AUDIO] Ordered broadcast to " .. tostring(#citySpeakers) .. " speaker(s).")
+    end
+
+    for i, item in ipairs(citySpeakers) do
+        if shouldContinue and not shouldContinue() then
+            return false, "cancelled"
+        end
+
+        local ok, err = playAudioBufferOnSpeaker(item, buffer, volume, debug, shouldContinue)
+
+        if not ok then
+            return false, err
+        end
+    end
+
+    return true
 end
 
 local function playOnAllSpeakers(sound, volume, pitch)
@@ -2135,6 +2189,7 @@ local function bootScreen()
     print("  time        - show Minecraft date/time")
     print("  morning     - force fresh GPT city broadcast")
     print("  speakers    - rescan/list visible speakers")
+    print("  speakerorder - show ordered broadcast order")
     print("  peripherals - list every visible peripheral")
     print("  monitors    - refresh/list monitor mirror")
     print("  montest     - test monitor mirror")
@@ -2197,6 +2252,9 @@ local function chatLoop()
             elseif lower == "speakers" then
                 rescanSpeakers()
 
+            elseif lower == "speakerorder" or lower == "sporder" then
+                printSpeakerOrder()
+
             elseif lower == "peripherals" then
                 printAllPeripherals()
 
@@ -2213,6 +2271,7 @@ local function chatLoop()
                 print("Morning broadcast language: angry Mandarin only")
                 print("TTS provider: " .. tostring(TTS_PROVIDER))
                 print("OpenAI TTS voice: " .. tostring(OPENAI_TTS_VOICE))
+                print("Speaker audio mode: ordered per-speaker broadcast")
 
             elseif lower == "update" or lower == "selfupdate" then
                 print("Forcing GitHub self-update from:")
