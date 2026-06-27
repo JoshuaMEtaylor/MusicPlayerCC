@@ -1,0 +1,718 @@
+-- JARVIS Speaker Terminal Node
+-- Install this on each local speaker controller terminal.
+--
+-- Wiring:
+--   - This computer needs a wireless/ender modem for rednet commands from JARVIS.
+--   - This computer can control one speaker directly, or multiple speakers on its
+--     own small wired speaker branch.
+--   - Keep this node's speaker branch separate from the main JARVIS wired PA bus
+--     unless you intentionally want this node to see those speakers too.
+--
+-- Optional:
+--   - Put JarvisKey.lua on this computer if you want OpenAI TTS on the node.
+--   - If no key exists, it falls back to legacy music.madefor.cc TTS.
+
+local VERSION = "1.1.0-multi-speaker-node"
+
+-- =============================================================================
+-- CONFIG
+-- =============================================================================
+
+local PROTOCOL = "JARVIS_PA_V1"
+
+local KEY_FILE = "JarvisKey.lua"
+
+local UPDATE_ENABLED = true
+local UPDATE_URL = "https://raw.githubusercontent.com/JoshuaMEtaylor/MusicPlayerCC/refs/heads/main/SpeakerNode"
+local UPDATE_SKIP_ARG = "--updated"
+
+local DEFAULT_VOICE = "cedar"
+local OPENAI_TTS_MODEL = "gpt-4o-mini-tts"
+local OPENAI_TTS_RESPONSE_FORMAT = "pcm"
+local OPENAI_TTS_PCM_CHUNK_SIZE = 65536
+
+local TTS_VOLUME = 1.0
+local MUSIC_VOLUME = 1.0
+local MUSIC_CHUNK_SIZE = 64 * 1024
+
+local NODE_LABEL = os.getComputerLabel() or ("SpeakerNode-" .. tostring(os.getComputerID()))
+
+local OPENAI_TTS_INSTRUCTIONS = [=[
+Speak clearly and naturally over a Minecraft public-address speaker.
+Use a firm, official JARVIS announcer style.
+Keep the voice intelligible and avoid mumbling or distortion.
+]=]
+
+local MORNING_TTS_INSTRUCTIONS = [=[
+Speak in Mandarin Chinese, Putonghua.
+Tone: angry, severe, commanding, official, disciplined, and impatient with disorder.
+Delivery: forceful public-address cadence, sharp emphasis, clear pronunciation.
+Do not scream, distort, mumble, or become cartoonish.
+Keep the voice intelligible over Minecraft speakers.
+]=]
+
+-- =============================================================================
+-- HELPERS
+-- =============================================================================
+
+local args = {...}
+
+local function trim(s)
+    return tostring(s or ""):match("^%s*(.-)%s*$")
+end
+
+local function hasArg(wanted)
+    for _, arg in ipairs(args) do
+        if tostring(arg) == wanted then return true end
+    end
+
+    return false
+end
+
+local function readAll(path)
+    if not fs.exists(path) then return nil end
+
+    local f = fs.open(path, "r")
+    if not f then return nil end
+
+    local data = f.readAll()
+    f.close()
+
+    return data
+end
+
+local function urlEncode(str)
+    str = tostring(str or "")
+
+    return str:gsub("([^%w%-_%.~])", function(c)
+        return string.format("%%%02X", string.byte(c))
+    end)
+end
+
+local function boolText(v)
+    return v and "yes" or "no"
+end
+
+local function splitSpeechChunks(text, maxLen)
+    text = trim(text or "")
+    maxLen = maxLen or 700
+
+    local chunks = {}
+
+    while #text > maxLen do
+        local head = text:sub(1, maxLen)
+        local cut = head:match("^(.*[%.%!%?%;%:%。%！%？%；%：])")
+
+        if cut and #cut > 80 then
+            chunks[#chunks + 1] = trim(cut)
+            text = trim(text:sub(#cut + 1))
+        else
+            chunks[#chunks + 1] = trim(head)
+            text = trim(text:sub(maxLen + 1))
+        end
+    end
+
+    if text ~= "" then
+        chunks[#chunks + 1] = text
+    end
+
+    return chunks
+end
+
+-- =============================================================================
+-- MODEM / LOCAL SPEAKERS
+-- =============================================================================
+
+local function peripheralHasType(name, wanted)
+    if peripheral.hasType then
+        local ok, result = pcall(function()
+            return peripheral.hasType(name, wanted)
+        end)
+
+        if ok and result then return true end
+    end
+
+    local pType = peripheral.getType(name)
+
+    if pType == wanted then return true end
+
+    if type(pType) == "table" then
+        for _, t in ipairs(pType) do
+            if t == wanted then return true end
+        end
+    end
+
+    return false
+end
+
+local function openAllModems()
+    local opened = 0
+
+    for _, name in ipairs(peripheral.getNames()) do
+        if peripheralHasType(name, "modem") and not rednet.isOpen(name) then
+            local ok, err = pcall(function()
+                rednet.open(name)
+            end)
+
+            if ok then
+                opened = opened + 1
+            else
+                print("Could not open modem " .. tostring(name) .. ": " .. tostring(err))
+            end
+        end
+    end
+
+    return opened
+end
+
+local localSpeakers = {}
+
+local function scanSpeakers()
+    localSpeakers = {}
+
+    for _, name in ipairs(peripheral.getNames()) do
+        if peripheralHasType(name, "speaker") then
+            local wrapped = peripheral.wrap(name)
+
+            if wrapped then
+                localSpeakers[#localSpeakers + 1] = {
+                    name = tostring(name),
+                    speaker = wrapped,
+                }
+            end
+        end
+    end
+
+    table.sort(localSpeakers, function(a, b)
+        local an = tonumber(tostring(a.name):match("(%d+)$"))
+        local bn = tonumber(tostring(b.name):match("(%d+)$"))
+
+        if an and bn and an ~= bn then
+            return an < bn
+        end
+
+        return tostring(a.name) < tostring(b.name)
+    end)
+
+    return localSpeakers
+end
+
+local function speakerCount()
+    if #localSpeakers == 0 then scanSpeakers() end
+    return #localSpeakers
+end
+
+local function speakerNames()
+    scanSpeakers()
+
+    local names = {}
+
+    for _, item in ipairs(localSpeakers) do
+        names[#names + 1] = item.name
+    end
+
+    return names
+end
+
+local function waitSpeakerEmpty(speakerName)
+    while true do
+        local event, p1 = os.pullEvent("speaker_audio_empty")
+
+        if p1 == nil or tostring(p1) == tostring(speakerName) then
+            return true
+        end
+    end
+end
+
+local function playBufferOnSpeaker(item, buffer, volume)
+    local name = tostring(item.name)
+
+    while true do
+        local ok, accepted = pcall(function()
+            return item.speaker.playAudio(buffer, volume or 1)
+        end)
+
+        if ok and accepted then
+            return true
+        end
+
+        if not ok then
+            return false, tostring(accepted)
+        end
+
+        waitSpeakerEmpty(name)
+    end
+end
+
+local function playBufferOnAll(buffer, volume)
+    scanSpeakers()
+
+    if #localSpeakers == 0 then
+        return false, "No local speakers visible to node."
+    end
+
+    for _, item in ipairs(localSpeakers) do
+        local ok, err = playBufferOnSpeaker(item, buffer, volume)
+
+        if not ok then
+            return false, tostring(item.name) .. ": " .. tostring(err)
+        end
+    end
+
+    return true
+end
+
+local function stopAudio()
+    scanSpeakers()
+
+    for _, item in ipairs(localSpeakers) do
+        pcall(function()
+            item.speaker.stop()
+        end)
+    end
+end
+
+local function playChime(volume)
+    scanSpeakers()
+
+    if #localSpeakers == 0 then
+        return false, "No local speakers."
+    end
+
+    for _, item in ipairs(localSpeakers) do
+        pcall(function()
+            item.speaker.stop()
+            item.speaker.playSound("minecraft:block.note_block.chime", volume or 1, 1)
+            sleep(0.1)
+            item.speaker.playSound("minecraft:block.note_block.chime", volume or 1, 1.25)
+        end)
+    end
+
+    return true
+end
+
+-- =============================================================================
+-- SELF UPDATE
+-- =============================================================================
+
+local function selfUpdate(force)
+    if not UPDATE_ENABLED then return nil end
+    if hasArg(UPDATE_SKIP_ARG) and not force then return nil end
+    if not http or not http.get then return nil end
+
+    local program = shell.getRunningProgram and shell.getRunningProgram() or "SpeakerNode"
+    if not program or program == "" then program = "SpeakerNode" end
+
+    print("[NODE] Checking update...")
+    local cb = tostring(os.epoch and os.epoch("utc") or math.floor(os.clock() * 100000))
+    local sep = UPDATE_URL:find("?", 1, true) and "&" or "?"
+    local handle = http.get(UPDATE_URL .. sep .. "cb=" .. cb, {
+        ["User-Agent"] = "CC-JARVIS-SpeakerNode",
+        ["Cache-Control"] = "no-cache",
+    })
+
+    if not handle then
+        print("Update failed: no HTTP response.")
+        return nil
+    end
+
+    local body = handle.readAll()
+    handle.close()
+
+    local okDownload =
+        body and #body > 1000 and
+        not body:find("404: Not Found", 1, true) and
+        not body:find("<html", 1, true) and
+        not body:find("<!DOCTYPE html", 1, true)
+
+    if not okDownload then
+        print("Update rejected: invalid raw Lua.")
+        return nil
+    end
+
+    local tmp = program .. ".new"
+    local old = program .. ".old"
+
+    fs.delete(tmp)
+
+    local f = fs.open(tmp, "w")
+    if not f then return nil end
+    f.write(body)
+    f.close()
+
+    fs.delete(old)
+
+    if fs.exists(program) then
+        fs.move(program, old)
+    end
+
+    fs.move(tmp, program)
+
+    print("Updated. Relaunching...")
+    sleep(0.5)
+
+    local relaunch = { program, UPDATE_SKIP_ARG }
+
+    for i = 1, #args do
+        if tostring(args[i]) ~= UPDATE_SKIP_ARG then
+            relaunch[#relaunch + 1] = tostring(args[i])
+        end
+    end
+
+    local unpackFn = table.unpack or unpack
+    shell.run(unpackFn(relaunch))
+
+    return "updated"
+end
+
+local updateResult = selfUpdate(false)
+if updateResult == "updated" then return end
+
+-- =============================================================================
+-- API KEY / TTS
+-- =============================================================================
+
+local API_KEY = nil
+
+local function loadKey()
+    local ok, result = pcall(function()
+        return require("JarvisKey")
+    end)
+
+    if ok and type(result) == "table" then
+        return result.OPENAI_API_KEY or result.api_key or result.key
+    elseif ok and type(result) == "string" then
+        return result
+    end
+
+    local raw = readAll(KEY_FILE)
+
+    if raw then
+        local key =
+            raw:match("OPENAI_API_KEY%s*=%s*['\"]([^'\"]+)['\"]") or
+            raw:match("api_key%s*=%s*['\"]([^'\"]+)['\"]") or
+            raw:match("key%s*=%s*['\"]([^'\"]+)['\"]") or
+            trim(raw)
+
+        if key and key ~= "" then return key end
+    end
+
+    return nil
+end
+
+local function pcm16leToSpeakerBuffer(chunk)
+    local out = {}
+    local oi = 1
+
+    for i = 1, #chunk - 1, 2 do
+        local lo = chunk:byte(i)
+        local hi = chunk:byte(i + 1)
+
+        local sample = hi * 256 + lo
+        if sample >= 32768 then sample = sample - 65536 end
+
+        local v = math.floor(sample / 256)
+
+        if v > 127 then v = 127 end
+        if v < -128 then v = -128 end
+
+        out[oi] = v
+        oi = oi + 1
+    end
+
+    return out
+end
+
+local cancelToken = 0
+
+local function shouldContinue(token)
+    return token == cancelToken
+end
+
+local function speakOpenAI(text, voice, volume, instructions, token)
+    if not API_KEY then
+        return false, "No OpenAI key."
+    end
+
+    local payload = textutils.serializeJSON({
+        model = OPENAI_TTS_MODEL,
+        voice = voice or DEFAULT_VOICE,
+        input = text,
+        instructions = instructions or OPENAI_TTS_INSTRUCTIONS,
+        response_format = OPENAI_TTS_RESPONSE_FORMAT,
+    })
+
+    local response = http.post("https://api.openai.com/v1/audio/speech", payload, {
+        ["Content-Type"] = "application/json",
+        ["Authorization"] = "Bearer " .. API_KEY,
+    }, true)
+
+    if not response then
+        return false, "OpenAI TTS HTTP request failed."
+    end
+
+    while shouldContinue(token) do
+        local chunk = response.read(OPENAI_TTS_PCM_CHUNK_SIZE)
+        if not chunk then break end
+
+        local audio = pcm16leToSpeakerBuffer(chunk)
+
+        if #audio > 0 then
+            local ok, err = playBufferOnAll(audio, volume or TTS_VOLUME)
+
+            if not ok then
+                response.close()
+                return false, err
+            end
+        end
+    end
+
+    response.close()
+
+    if shouldContinue(token) then
+        return true, "spoken"
+    else
+        return false, "cancelled"
+    end
+end
+
+local function speakLegacy(text, volume, token)
+    local dfpwm = require("cc.audio.dfpwm")
+    local decoder = dfpwm.make_decoder()
+
+    local url = "https://music.madefor.cc/tts?text=" .. urlEncode(text)
+    local response = http.get(url, nil, true)
+
+    if not response then
+        return false, "Legacy TTS HTTP request failed."
+    end
+
+    while shouldContinue(token) do
+        local chunk = response.read(16 * 1024)
+        if not chunk then break end
+
+        local audio = decoder(chunk)
+        local ok, err = playBufferOnAll(audio, volume or TTS_VOLUME)
+
+        if not ok then
+            response.close()
+            return false, err
+        end
+    end
+
+    response.close()
+
+    if shouldContinue(token) then
+        return true, "spoken"
+    else
+        return false, "cancelled"
+    end
+end
+
+local function speakText(text, voice, volume, language, token)
+    local instructions = OPENAI_TTS_INSTRUCTIONS
+
+    if language == "mandarin_morning" then
+        instructions = MORNING_TTS_INSTRUCTIONS
+    end
+
+    local chunks = splitSpeechChunks(text, 700)
+
+    for i, chunk in ipairs(chunks) do
+        if not shouldContinue(token) then
+            return false, "cancelled"
+        end
+
+        local ok, err = speakOpenAI(chunk, voice, volume, instructions, token)
+
+        if not ok then
+            print("[TTS] OpenAI failed: " .. tostring(err))
+            print("[TTS] Trying legacy fallback...")
+            ok, err = speakLegacy(chunk, volume, token)
+
+            if not ok then
+                return false, err
+            end
+        end
+
+        sleep(0.05)
+    end
+
+    return true, "spoken"
+end
+
+local function playMusicUrl(url, volume, token)
+    local dfpwm = require("cc.audio.dfpwm")
+    local decoder = dfpwm.make_decoder()
+
+    local response = http.get(url, nil, true)
+
+    if not response then
+        return false, "Music HTTP request failed."
+    end
+
+    while shouldContinue(token) do
+        local chunk = response.read(MUSIC_CHUNK_SIZE)
+        if not chunk then break end
+
+        local audio = decoder(chunk)
+        local ok, err = playBufferOnAll(audio, volume or MUSIC_VOLUME)
+
+        if not ok then
+            response.close()
+            return false, err
+        end
+    end
+
+    response.close()
+
+    if shouldContinue(token) then
+        return true, "played"
+    else
+        return false, "cancelled"
+    end
+end
+
+-- =============================================================================
+-- JOB SYSTEM
+-- =============================================================================
+
+local currentJob = nil
+
+local function ack(to, commandId, ok, status, extra)
+    local msg = {
+        type = "ack",
+        command_id = commandId,
+        ok = ok,
+        status = status,
+        label = NODE_LABEL,
+        speaker_count = speakerCount(),
+        speakers = speakerNames(),
+        version = VERSION,
+    }
+
+    if extra then
+        for k, v in pairs(extra) do
+            msg[k] = v
+        end
+    end
+
+    rednet.send(to, msg, PROTOCOL)
+end
+
+local function setJob(job)
+    cancelToken = cancelToken + 1
+    stopAudio()
+
+    currentJob = job
+    os.queueEvent("jarvis_node_job")
+end
+
+local function listenerLoop()
+    while true do
+        local sender, msg = rednet.receive(PROTOCOL)
+
+        if type(msg) == "table" then
+            if msg.type == "discover" then
+                ack(sender, msg.command_id, true, "hello", { response_type = "hello" })
+
+            elseif msg.type == "stop" then
+                cancelToken = cancelToken + 1
+                currentJob = nil
+                stopAudio()
+                ack(sender, msg.command_id, true, "stopped")
+
+            elseif msg.type == "test_chime" then
+                cancelToken = cancelToken + 1
+                stopAudio()
+                local ok, err = playChime(msg.volume or 1)
+                ack(sender, msg.command_id, ok, ok and "chime sent" or tostring(err))
+
+            elseif msg.type == "speak" then
+                setJob({
+                    type = "speak",
+                    sender = sender,
+                    command_id = msg.command_id,
+                    text = tostring(msg.text or ""),
+                    voice = msg.voice or DEFAULT_VOICE,
+                    volume = msg.volume or TTS_VOLUME,
+                    language = msg.language or "normal",
+                    token = cancelToken,
+                })
+
+                ack(sender, msg.command_id, true, "speak queued")
+
+            elseif msg.type == "music" then
+                setJob({
+                    type = "music",
+                    sender = sender,
+                    command_id = msg.command_id,
+                    url = tostring(msg.url or ""),
+                    name = tostring(msg.name or "track"),
+                    volume = msg.volume or MUSIC_VOLUME,
+                    token = cancelToken,
+                })
+
+                ack(sender, msg.command_id, true, "music queued")
+
+            elseif msg.type == "update" then
+                ack(sender, msg.command_id, true, "updating")
+                selfUpdate(true)
+
+            elseif msg.type == "set_label" then
+                NODE_LABEL = tostring(msg.label or NODE_LABEL)
+                os.setComputerLabel(NODE_LABEL)
+                ack(sender, msg.command_id, true, "label set")
+            end
+        end
+    end
+end
+
+local function workerLoop()
+    while true do
+        os.pullEvent("jarvis_node_job")
+
+        local job = currentJob
+        currentJob = nil
+
+        if job then
+            local ok, result = false, "unknown job"
+
+            if job.type == "speak" then
+                print("[NODE] Speaking request from " .. tostring(job.sender))
+                ok, result = speakText(job.text, job.voice, job.volume, job.language, job.token)
+
+            elseif job.type == "music" then
+                print("[NODE] Playing music: " .. tostring(job.name))
+                ok, result = playMusicUrl(job.url, job.volume, job.token)
+            end
+
+            ack(job.sender, job.command_id, ok, result)
+            print("[NODE] Job finished: " .. tostring(result))
+        end
+    end
+end
+
+-- =============================================================================
+-- STARTUP
+-- =============================================================================
+
+openAllModems()
+scanSpeakers()
+API_KEY = loadKey()
+
+print("")
+print("JARVIS SPEAKER TERMINAL NODE")
+print("Version: " .. VERSION)
+print("Computer ID: " .. tostring(os.getComputerID()))
+print("Label: " .. tostring(NODE_LABEL))
+print("Protocol: " .. PROTOCOL)
+print("Local speakers: " .. tostring(#localSpeakers))
+for i, item in ipairs(localSpeakers) do
+    print("  " .. tostring(i) .. ". " .. tostring(item.name))
+end
+print("OpenAI key: " .. boolText(API_KEY ~= nil))
+print("Waiting for JARVIS PA commands...")
+print("")
+
+parallel.waitForAny(listenerLoop, workerLoop)
