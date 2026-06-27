@@ -5,10 +5,11 @@
 --   JARVIS sends one command:
 --      play this TTS text, then play this music URL.
 --
--- The node does not use OpenAI, JarvisKey, or audio packet streams.
--- It only uses HTTP to fetch the public TTS/music audio it was told to play.
+-- The node uses OpenAI TTS only if JarvisKey.lua is present.
+-- It does not call GPT/chat. Main JARVIS supplies the text and music URL.
+-- It fetches/plays the same programme locally through its attached speakers.
 
-local VERSION = "3.0.6-command-node-gpt-tts-verbose"
+local VERSION = "3.0.8-command-node-sync-start"
 local PROTOCOL = "JARVIS_PA_V1"
 
 local NODE_LABEL = os.getComputerLabel() or ("SpeakerNode-" .. tostring(os.getComputerID()))
@@ -24,7 +25,7 @@ local KEY_FILE = "JarvisKey.lua"
 local OPENAI_TTS_MODEL = "gpt-4o-mini-tts"
 local OPENAI_TTS_VOICE = "cedar"
 local OPENAI_TTS_RESPONSE_FORMAT = "pcm"
-local OPENAI_TTS_PCM_CHUNK_SIZE = 8192
+local OPENAI_TTS_PCM_CHUNK_SIZE = 4096
 local OPENAI_TTS_TEXT_CHUNK_MAX = 300
 local OPENAI_TTS_SPEED = 1.0
 
@@ -37,7 +38,6 @@ local LOG_EVERY_AUDIO_CHUNKS = 10
 local API_KEY = nil
 
 local localSpeakers = {}
-local currentJob = nil
 local cancelToken = 0
 
 -- =============================================================================
@@ -642,13 +642,44 @@ local function playMusicUrl(url, name, volume, token)
     return streamDfpwmUrl(url, volume or MUSIC_VOLUME, token, "music: " .. tostring(name or "track"))
 end
 
-local function setJob(job)
-    cancelToken = cancelToken + 1
-    stopAudio()
+local function runProgramJob(job)
+    local ok, result = true, "done"
 
-    job.token = cancelToken
-    currentJob = job
-    os.queueEvent("jarvis_node_job")
+    print("[NODE] Program from " .. tostring(job.sender) .. ": TTS then music.")
+    log("JOB", "TTS chars=" .. tostring(#tostring(job.tts_text or "")) .. " | music=" .. tostring(job.music_name or "track"))
+    log("JOB", "Music URL=" .. shortText(job.music_url, 110))
+
+    ok, result = playTtsText(job.tts_text, job.tts_volume, job.token, job.tts_voice, job.tts_model, job.tts_instructions)
+
+    if ok and shouldContinue(job.token) then
+        log("JOB", "TTS finished; starting music.")
+        ok, result = playMusicUrl(job.music_url, job.music_name, job.music_volume, job.token)
+    else
+        log("JOB", "Music skipped because TTS failed/cancelled: " .. tostring(result))
+    end
+
+    print("[NODE] Job finished: " .. tostring(ok and "OK" or "FAILED") .. " | " .. tostring(result))
+    return ok, result
+end
+
+local function runSpeakJob(job)
+    local ok, result = true, "done"
+
+    print("[NODE] Speak from " .. tostring(job.sender))
+    ok, result = playTtsText(job.text, job.volume, job.token, job.tts_voice, job.tts_model, job.tts_instructions)
+
+    print("[NODE] Job finished: " .. tostring(ok and "OK" or "FAILED") .. " | " .. tostring(result))
+    return ok, result
+end
+
+local function runMusicJob(job)
+    local ok, result = true, "done"
+
+    print("[NODE] Music from " .. tostring(job.sender) .. ": " .. tostring(job.name))
+    ok, result = playMusicUrl(job.url, job.name, job.volume, job.token)
+
+    print("[NODE] Job finished: " .. tostring(ok and "OK" or "FAILED") .. " | " .. tostring(result))
+    return ok, result
 end
 
 -- =============================================================================
@@ -665,7 +696,6 @@ local function listenerLoop()
 
             elseif msg.type == "stop" then
                 cancelToken = cancelToken + 1
-                currentJob = nil
                 stopAudio()
                 ack(sender, msg.command_id, true, "stopped")
 
@@ -676,7 +706,11 @@ local function listenerLoop()
                 ack(sender, msg.command_id, ok, ok and "chime sent" or tostring(err))
 
             elseif msg.type == "program" then
-                setJob({
+                -- No queue. The command is received and the programme starts immediately.
+                cancelToken = cancelToken + 1
+                stopAudio()
+
+                local job = {
                     type = "program",
                     sender = sender,
                     command_id = msg.command_id,
@@ -688,12 +722,18 @@ local function listenerLoop()
                     tts_model = tostring(msg.tts_model or OPENAI_TTS_MODEL),
                     tts_instructions = msg.tts_instructions,
                     music_volume = msg.music_volume or MUSIC_VOLUME,
-                })
+                    token = cancelToken,
+                }
 
-                ack(sender, msg.command_id, true, "program queued")
+                ack(sender, msg.command_id, true, "program received; starting now")
+                runProgramJob(job)
 
             elseif msg.type == "speak" then
-                setJob({
+                -- No queue. Speak immediately.
+                cancelToken = cancelToken + 1
+                stopAudio()
+
+                local job = {
                     type = "speak",
                     sender = sender,
                     command_id = msg.command_id,
@@ -702,65 +742,35 @@ local function listenerLoop()
                     tts_voice = tostring(msg.voice or msg.tts_voice or OPENAI_TTS_VOICE),
                     tts_model = tostring(msg.tts_model or OPENAI_TTS_MODEL),
                     tts_instructions = msg.tts_instructions,
-                })
+                    token = cancelToken,
+                }
 
-                ack(sender, msg.command_id, true, "speak queued")
+                ack(sender, msg.command_id, true, "speak received; starting now")
+                runSpeakJob(job)
 
             elseif msg.type == "music" then
-                setJob({
+                -- No queue. Music starts immediately.
+                cancelToken = cancelToken + 1
+                stopAudio()
+
+                local job = {
                     type = "music",
                     sender = sender,
                     command_id = msg.command_id,
                     url = tostring(msg.url or ""),
                     name = tostring(msg.name or "track"),
                     volume = msg.volume or MUSIC_VOLUME,
-                })
+                    token = cancelToken,
+                }
 
-                ack(sender, msg.command_id, true, "music queued")
+                ack(sender, msg.command_id, true, "music received; starting now")
+                runMusicJob(job)
 
             elseif msg.type == "set_label" then
                 NODE_LABEL = tostring(msg.label or NODE_LABEL)
                 os.setComputerLabel(NODE_LABEL)
                 ack(sender, msg.command_id, true, "label set")
             end
-        end
-    end
-end
-
-local function workerLoop()
-    while true do
-        os.pullEvent("jarvis_node_job")
-
-        local job = currentJob
-        currentJob = nil
-
-        if job then
-            local ok, result = true, "done"
-
-            if job.type == "program" then
-                print("[NODE] Program from " .. tostring(job.sender) .. ": TTS then music.")
-                log("JOB", "TTS chars=" .. tostring(#tostring(job.tts_text or "")) .. " | music=" .. tostring(job.music_name or "track"))
-                log("JOB", "Music URL=" .. shortText(job.music_url, 110))
-                ok, result = playTtsText(job.tts_text, job.tts_volume, job.token, job.tts_voice, job.tts_model, job.tts_instructions)
-
-                if ok and shouldContinue(job.token) then
-                    log("JOB", "TTS finished; starting music.")
-                    ok, result = playMusicUrl(job.music_url, job.music_name, job.music_volume, job.token)
-                else
-                    log("JOB", "Music skipped because TTS failed/cancelled: " .. tostring(result))
-                end
-
-            elseif job.type == "speak" then
-                print("[NODE] Speak from " .. tostring(job.sender))
-                ok, result = playTtsText(job.text, job.volume, job.token, job.tts_voice, job.tts_model, job.tts_instructions)
-
-            elseif job.type == "music" then
-                print("[NODE] Music from " .. tostring(job.sender) .. ": " .. tostring(job.name))
-                ok, result = playMusicUrl(job.url, job.name, job.volume, job.token)
-            end
-
-            ack(job.sender, job.command_id, ok, result)
-            print("[NODE] Job finished: " .. tostring(ok and "OK" or "FAILED") .. " | " .. tostring(result))
         end
     end
 end
@@ -832,15 +842,17 @@ print("Version: " .. VERSION)
 print("Computer ID: " .. tostring(os.getComputerID()))
 print("Label: " .. tostring(NODE_LABEL))
 print("Protocol: " .. PROTOCOL)
-print("Role: receive command, play GPT TTS, then play music")
+print("Role: receive same JARVIS programme and immediately play GPT TTS, then music")
 print("HTTP: used for OpenAI TTS and public music URLs")
 print("OpenAI key: " .. boolText(API_KEY ~= nil))
 print("GPT note: no chat/GPT prompt calls, only TTS audio.")
+print("Queue: none. Programme commands ACK and start immediately.")
 print("Local speakers: " .. tostring(#localSpeakers))
 for i, item in ipairs(localSpeakers) do
     print("  " .. tostring(i) .. ". " .. tostring(item.name))
 end
+print("Sync: starts immediately after programme command ACK.")
 print("Waiting for JARVIS commands...")
 print("")
 
-parallel.waitForAny(listenerLoop, workerLoop, commandLoop)
+parallel.waitForAny(listenerLoop, commandLoop)
