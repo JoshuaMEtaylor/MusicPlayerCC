@@ -31,7 +31,7 @@
 --   stopmusic
 -- =============================================================================
 
-local VERSION = "2.3.0-drain-sync-fanout"
+local VERSION = "2.4.0-speaker-ping-lockstep"
 local args = {...}
 
 -- =============================================================================
@@ -107,6 +107,10 @@ local AUDIO_DRAIN_TIMEOUT = 14.0
 local HARD_STOP_PASSES = 5
 local HARD_STOP_GAP = 0.18
 local PRE_MUSIC_SETTLE_SECONDS = 1.0
+local SPEAKER_PING_TIMEOUT = 8.0
+local SPEAKER_PING_ATTEMPTS = 3
+local AUDIO_LOCKSTEP_MODE = true
+local AUDIO_LOCKSTEP_TIMEOUT = 8.0
 
 -- Important:
 -- When true, JARVIS ignores the disabled-speaker list and attempts to feed every
@@ -1081,6 +1085,99 @@ local function resetAudioNetwork(reason)
     return count
 end
 
+
+local function makeSilentProbeBuffer()
+    local buffer = {}
+
+    -- Short silent PCM probe. It should not be audible, but it still goes
+    -- through speaker.playAudio and should produce speaker_audio_empty.
+    for i = 1, 4096 do
+        buffer[i] = 0
+    end
+
+    return buffer
+end
+
+local function speakerPingAll(label, debug)
+    scanSpeakers()
+
+    local targetCount = activeSpeakerCount()
+
+    if targetCount == 0 then
+        return false, "No targeted speakers."
+    end
+
+    if debug then
+        print("[PING] Speaker ping: " .. tostring(label or "audio") .. " | targets=" .. tostring(targetCount) .. "/" .. tostring(speakerCount()))
+    end
+
+    local probe = makeSilentProbeBuffer()
+
+    for attempt = 1, SPEAKER_PING_ATTEMPTS do
+        if debug then
+            print("[PING] Attempt " .. tostring(attempt) .. "/" .. tostring(SPEAKER_PING_ATTEMPTS))
+        end
+
+        hardStopAllSpeakers("speaker ping", debug)
+        sleep(0.2)
+
+        local sent, sendErr = playAudioBufferOnAll(probe, 1, debug, nil)
+
+        if sent then
+            local drained, drainErr = waitForTargetSpeakersEmpty("speaker ping " .. tostring(label or ""), SPEAKER_PING_TIMEOUT, debug, nil)
+
+            if drained then
+                if debug then print("[PING] All targeted speakers responded.") end
+                return true
+            end
+
+            if debug then print("[PING] Drain failed: " .. tostring(drainErr)) end
+        else
+            if debug then print("[PING] Send failed: " .. tostring(sendErr)) end
+        end
+    end
+
+    hardStopAllSpeakers("failed speaker ping", debug)
+    return false, "One or more speakers did not respond to ping."
+end
+
+local function preflightSpeakers(label, debug)
+    local ok, err = speakerPingAll(label, debug)
+
+    if not ok then
+        print("[PING] WARNING: " .. tostring(err))
+        print("[PING] JARVIS will still attempt playback to every visible speaker.")
+        return false, err
+    end
+
+    return true
+end
+
+local function lockstepDrainAfterChunk(label, debug, shouldContinue)
+    if not AUDIO_LOCKSTEP_MODE then
+        return true
+    end
+
+    local drained, drainErr = waitForTargetSpeakersEmpty(label or "audio chunk", AUDIO_LOCKSTEP_TIMEOUT, debug, shouldContinue)
+
+    if not drained then
+        if drainErr == "cancelled" then
+            return false, drainErr
+        end
+
+        if debug then
+            print("[SYNC] Lockstep drain warning: " .. tostring(drainErr))
+        end
+
+        -- Keep all speakers together. If one misses its ready event, reset all
+        -- buffers so it cannot lag behind with old audio.
+        hardStopAllSpeakers("lockstep recovery", debug)
+    end
+
+    return true
+end
+
+
 local function playOnAllSpeakers(sound, volume, pitch)
     if #citySpeakers == 0 then scanSpeakers() end
 
@@ -1204,6 +1301,12 @@ local function speakerFanoutDebug()
 
     if ok then
         print("Fanout test accepted by every targeted speaker.")
+        local drained, drainErr = waitForTargetSpeakersEmpty("fanout debug", SPEAKER_PING_TIMEOUT, true, nil)
+        if drained then
+            print("Fanout test drained/responded from every targeted speaker.")
+        else
+            print("Fanout drain failed: " .. tostring(drainErr))
+        end
     else
         print("Fanout test failed: " .. tostring(err))
     end
@@ -1226,6 +1329,36 @@ local function speakerDrainDebug()
     line()
     print("")
 end
+
+
+local function speakerPingDebug()
+    print("")
+    line()
+    print("SPEAKER PING DEBUG")
+    print("Visible speakers: " .. tostring(speakerCount()))
+    print("Targeted speakers: " .. tostring(activeSpeakerCount()))
+    print("Force all visible speakers: " .. boolText(FORCE_ALL_VISIBLE_SPEAKERS))
+    print("Lockstep mode: " .. boolText(AUDIO_LOCKSTEP_MODE))
+    print("")
+
+    scanSpeakers()
+    for i, item in ipairs(citySpeakers) do
+        print(tostring(i) .. ". " .. tostring(item.name))
+    end
+
+    print("")
+    local ok, err = speakerPingAll("manual diagnostic", true)
+
+    if ok then
+        print("[PING] RESULT: OK - every targeted speaker accepted and returned speaker_audio_empty.")
+    else
+        print("[PING] RESULT: FAILED - " .. tostring(err))
+    end
+
+    line()
+    print("")
+end
+
 
 local function disableSpeakerCommand(ref)
     scanSpeakers()
@@ -1432,6 +1565,7 @@ local function musicLoop()
             scanSpeakers()
             print("[MUSIC] Opening stream: " .. tostring(track.name))
             print("[MUSIC] Broadcasting to " .. tostring(activeSpeakerCount()) .. "/" .. tostring(speakerCount()) .. " visible speaker(s).")
+            preflightSpeakers("music", true)
 
             local handle = http.get(track.url, {
                 ["User-Agent"] = "CC-Tweaked-JARVIS-Music",
@@ -1475,6 +1609,14 @@ local function musicLoop()
 
                     if not played and playErr ~= "cancelled" then
                         error(playErr or "speaker playback failed")
+                    end
+
+                    local synced, syncErr = lockstepDrainAfterChunk("music chunk " .. tostring(chunks), false, function()
+                        return musicState.playing and not musicState.stop and token == musicState.token
+                    end)
+
+                    if not synced and syncErr == "cancelled" then
+                        break
                     end
                 end
 
@@ -1706,6 +1848,11 @@ local function speakOneChunkOpenAI(cleaned, debug, chunkIndex, chunkCount, ttsIn
                 if not played then
                     error(playErr or "Speaker playback failed.")
                 end
+
+                local synced, syncErr = lockstepDrainAfterChunk("TTS PCM chunk " .. tostring(chunks), debug, nil)
+                if not synced and syncErr == "cancelled" then
+                    error("TTS cancelled during lockstep drain.")
+                end
             end
         end
 
@@ -1764,6 +1911,12 @@ local function speakOneChunkLegacy(cleaned, debug, chunkIndex, chunkCount)
                 response.close()
                 error(playErr or "Speaker playback failed.")
             end
+
+            local synced, syncErr = lockstepDrainAfterChunk("legacy TTS chunk " .. tostring(chunks), debug, nil)
+            if not synced and syncErr == "cancelled" then
+                response.close()
+                error("Legacy TTS cancelled during lockstep drain.")
+            end
         end
 
         response.close()
@@ -1810,6 +1963,8 @@ local function speakToCity(text, debug, ttsInstructions)
 
     local chunks = splitSpeechChunks(text)
     if #chunks == 0 then return false, "Nothing to speak." end
+
+    preflightSpeakers("TTS", debug)
 
     if debug then
         local total = 0
@@ -2358,6 +2513,7 @@ local function bootScreen()
     print("Wired speaker peripherals targeted: " .. tostring(activeSpeakerCount()))
     print("TTS: " .. (TTS_ENABLED and "enabled" or "disabled"))
     print("Music tracks loaded: " .. tostring(#musicTracks))
+    print("Speaker ping/lockstep: " .. boolText(AUDIO_LOCKSTEP_MODE))
     print("")
     print("Commands:")
     print("  exit        - close JARVIS")
@@ -2371,6 +2527,7 @@ local function bootScreen()
     print("  testeach    - test every speaker one by one")
     print("  spfanout    - test raw audio fanout to all visible speakers")
     print("  spreset     - hard reset/clear every speaker buffer")
+    print("  spping      - silent ping/handshake every speaker")
     print("  spbase      - save current speaker map")
     print("  spdiff      - compare current speakers to saved map")
     print("  spoffmiss   - disable speakers missing from saved map")
@@ -2447,6 +2604,9 @@ local function chatLoop()
 
             elseif lower == "spreset" or lower == "speakerreset" or lower == "audioreset" then
                 speakerDrainDebug()
+
+            elseif lower == "spping" or lower == "speakerping" or lower == "ping speakers" then
+                speakerPingDebug()
 
             elseif lower == "spbase" or lower == "speakerbase" or lower == "speaker baseline" then
                 saveSpeakerBaseline()
