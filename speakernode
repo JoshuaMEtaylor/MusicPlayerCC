@@ -1,4 +1,4 @@
--- JARVIS Command Speaker Node
+1-- JARVIS Command Speaker Node
 -- Version: 3.0.0-command-program-node
 --
 -- Sensible node model:
@@ -8,7 +8,7 @@
 -- The node does not use OpenAI, JarvisKey, or audio packet streams.
 -- It only uses HTTP to fetch the public TTS/music audio it was told to play.
 
-local VERSION = "3.0.1-command-program-node-gpt-tts-only"
+local VERSION = "3.0.2-command-program-node-gpt-tts-speed-fix"
 local PROTOCOL = "JARVIS_PA_V1"
 
 local NODE_LABEL = os.getComputerLabel() or ("SpeakerNode-" .. tostring(os.getComputerID()))
@@ -26,6 +26,12 @@ local OPENAI_TTS_MODEL = "gpt-4o-mini-tts"
 local OPENAI_TTS_VOICE = "cedar"
 local OPENAI_TTS_RESPONSE_FORMAT = "pcm"
 local OPENAI_TTS_PCM_CHUNK_SIZE = 65536
+
+-- OpenAI raw PCM TTS is 24 kHz mono PCM.
+-- ComputerCraft speakers play buffers at 48 kHz.
+-- Therefore each OpenAI sample must become two CC speaker samples.
+local OPENAI_TTS_SOURCE_RATE = 24000
+local CC_SPEAKER_RATE = 48000
 local OPENAI_TTS_INSTRUCTIONS = [=[
 Speak clearly and naturally over a Minecraft public-address speaker.
 Use the same official JARVIS announcer style as the main terminal.
@@ -314,6 +320,11 @@ local function loadKey()
 end
 
 local function pcm16leToSpeakerBuffer(chunk)
+    -- Convert OpenAI 16-bit little-endian 24 kHz mono PCM into
+    -- ComputerCraft's signed 8-bit 48 kHz speaker buffer.
+    --
+    -- The important part is the 24 kHz -> 48 kHz upsample.
+    -- Without this, the TTS plays too fast.
     local out = {}
     local oi = 1
 
@@ -329,8 +340,11 @@ local function pcm16leToSpeakerBuffer(chunk)
         if v > 127 then v = 127 end
         if v < -128 then v = -128 end
 
+        -- 24 kHz source -> 48 kHz CC speaker rate.
+        -- Duplicate each sample once. This preserves duration/speed.
         out[oi] = v
-        oi = oi + 1
+        out[oi + 1] = v
+        oi = oi + 2
     end
 
     return out
@@ -379,7 +393,7 @@ local function speakOpenAIChunk(text, voice, model, instructions, volume, token)
         response_format = OPENAI_TTS_RESPONSE_FORMAT,
     })
 
-    print("[NODE] GPT TTS voice=" .. tostring(voice or OPENAI_TTS_VOICE))
+    print("[NODE] GPT TTS voice=" .. tostring(voice or OPENAI_TTS_VOICE) .. " | PCM 24k->48k speed fix")
 
     local response = http.post("https://api.openai.com/v1/audio/speech", payload, {
         ["Content-Type"] = "application/json",
