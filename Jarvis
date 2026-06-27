@@ -31,7 +31,7 @@
 --   stopmusic
 -- =============================================================================
 
-local VERSION = "3.9.0-nohold-speaker-broadcast"
+local VERSION = "3.10.1-stable-quarantine-broadcast"
 local args = {...}
 
 -- =============================================================================
@@ -59,18 +59,13 @@ local AUDIO_WAIT_TIMEOUT = 0.35
 local SPEAKER_ORDERED_SEND_TIMEOUT = 8
 local SPEAKER_ORDERED_MAX_RETRIES = 80
 
--- Broadcast mode:
--- true = never let one slow/full speaker hold up the whole town broadcast.
--- A full speaker skips that chunk. After repeated skips, JARVIS stops that speaker
--- once and retries so it can catch up instead of staying minutes behind.
-local SPEAKER_SKIP_LAGGING = true
-local SPEAKER_MAX_CONSECUTIVE_SKIPS = 2
-local SPEAKER_RETRY_AFTER_STOP = true
-
--- Absolute no-hold mode:
--- No speaker is ever allowed to block the broadcast.
--- If full: stop only that speaker, retry once, then skip that chunk.
-local SPEAKER_NOHOLD_MODE = true
+-- Stable quarantine broadcast:
+-- Good speakers get the full stream.
+-- Bad/lagging speakers are dropped from the target list instead of causing delay
+-- or receiving partial chunks.
+local SPEAKER_QUARANTINE_ON_LAG = true
+local SPEAKER_LAG_TIMEOUT = 0.35
+local SPEAKER_MAX_FULL_RETRIES = 2
 local SPEAKER_TEST_TIMEOUT = 8
 local SPEAKER_AUDIBLE_TEST_HZ = 660
 local SPEAKER_AUDIBLE_TEST_VOLUME = 1.0
@@ -658,7 +653,7 @@ end
 -- =============================================================================
 
 local citySpeakers = {}
-local speakerRuntimeStats = {}
+local speakerQuarantine = {}
 
 local function peripheralIsSpeaker(name)
     if not name then return false end
@@ -747,8 +742,8 @@ local function printSpeakerOrder()
     print("")
     line()
     print("ORDERED BROADCAST SPEAKER ORDER")
-    print("Each audio buffer is offered once to each speaker in this order.")
-    print("Mode: NO-HOLD. Full speaker = reset once, then skip chunk. No waiting.")
+    print("Active speakers receive every audio buffer in this order.")
+    print("Dropped/quarantined speakers receive no audio until restored.")
     print("")
 
     for i, item in ipairs(citySpeakers) do
@@ -763,7 +758,7 @@ local function printSpeakers()
     print("")
     line()
     print("WIRED CITY SPEAKER NETWORK")
-    print("Audio mode: ordered per-speaker broadcast")
+    print("Audio mode: stable ordered broadcast with speaker quarantine")
     print("Detected speaker peripherals: " .. tostring(#citySpeakers))
     print("TTS: " .. (TTS_ENABLED and "enabled" or "disabled"))
     print("Music: " .. (MUSIC_VOLUME > 0 and "enabled" or "muted"))
@@ -796,174 +791,213 @@ local function rescanSpeakers()
     printSpeakers()
 end
 
-local function getSpeakerStats(name)
-    name = tostring(name or "?")
+local function isSpeakerQuarantined(name)
+    return speakerQuarantine[tostring(name or "")] ~= nil
+end
 
-    if not speakerRuntimeStats[name] then
-        speakerRuntimeStats[name] = {
-            accepted = 0,
-            skipped = 0,
-            errors = 0,
-            resets = 0,
-            consecutiveSkips = 0,
-            last = "never",
-        }
+local function quarantineSpeaker(name, reason)
+    name = tostring(name or "")
+    if name == "" then return end
+
+    if not speakerQuarantine[name] then
+        speakerQuarantine[name] = tostring(reason or "dropped")
+        print("[AUDIO] DROPPED " .. name .. " from broadcast: " .. tostring(reason or "dropped"))
     end
-
-    return speakerRuntimeStats[name]
 end
 
-local function resetSpeakerStats()
-    speakerRuntimeStats = {}
-    print("Speaker runtime stats cleared.")
+local function clearSpeakerQuarantine()
+    speakerQuarantine = {}
+    print("Speaker quarantine cleared. All visible speakers will be tried again.")
 end
 
-local function printSpeakerRuntimeStats()
+local function resolveSpeakerRef(ref)
     scanSpeakers()
 
-    print("")
-    line()
-    print("SPEAKER RUNTIME STATS")
-    print("Mode: NO-HOLD. Lagging speakers cannot delay broadcast.")
-    print("Max consecutive skips before reset: " .. tostring(SPEAKER_MAX_CONSECUTIVE_SKIPS))
-    print("")
-    print("No  Speaker              Accepted  Skipped  Reset  Err  Last")
-    print("--  -------------------  --------  -------  -----  ---  ----------------")
+    ref = trim(ref or "")
+    if ref == "" then return nil, "No speaker reference supplied." end
 
-    for i, item in ipairs(citySpeakers) do
-        local name = tostring(item.name)
-        local st = getSpeakerStats(name)
-
-        local n = tostring(i)
-        if #n < 2 then n = " " .. n end
-
-        local display = name
-        if #display > 19 then display = display:sub(1, 19) end
-        while #display < 19 do display = display .. " " end
-
-        local accepted = tostring(st.accepted or 0)
-        while #accepted < 8 do accepted = " " .. accepted end
-
-        local skipped = tostring(st.skipped or 0)
-        while #skipped < 7 do skipped = " " .. skipped end
-
-        local resets = tostring(st.resets or 0)
-        while #resets < 5 do resets = " " .. resets end
-
-        local errors = tostring(st.errors or 0)
-        while #errors < 3 do errors = " " .. errors end
-
-        print(n .. "  " .. display .. "  " .. accepted .. "  " .. skipped .. "  " .. resets .. "  " .. errors .. "  " .. tostring(st.last or ""))
-    end
-
-    line()
-    print("")
-end
-
-local function playAudioBufferOnSpeakerNoHold(item, buffer, volume, debug, shouldContinue)
-    local name = tostring(item.name)
-    local st = getSpeakerStats(name)
-
-    if shouldContinue and not shouldContinue() then
-        return true, "cancelled"
-    end
-
-    -- First attempt.
-    local ok, accepted = pcall(function()
-        return item.speaker.playAudio(buffer, volume or 1)
-    end)
-
-    if ok and accepted then
-        st.accepted = st.accepted + 1
-        st.consecutiveSkips = 0
-        st.last = "accepted"
-
-        if debug then
-            print("[AUDIO] " .. name .. " accepted")
-        end
-
-        return true, "accepted"
-    end
-
-    if not ok then
-        st.errors = st.errors + 1
-        st.last = "error: " .. tostring(accepted)
-        if debug then
-            print("[AUDIO] " .. name .. " error; skipped: " .. tostring(accepted))
-        end
-        return true, "error skipped"
-    end
-
-    -- Full buffer. Do not wait. Clear only this speaker and retry once.
-    st.skipped = st.skipped + 1
-    st.consecutiveSkips = st.consecutiveSkips + 1
-    st.last = "full; reset retry"
-
-    if debug then
-        print("[AUDIO] " .. name .. " full; reset+retry")
-    end
-
-    pcall(function()
-        item.speaker.stop()
-    end)
-
-    sleep(0)
-
-    local ok2, accepted2 = pcall(function()
-        return item.speaker.playAudio(buffer, volume or 1)
-    end)
-
-    if ok2 and accepted2 then
-        st.accepted = st.accepted + 1
-        st.resets = st.resets + 1
-        st.consecutiveSkips = 0
-        st.last = "reset+accepted"
-
-        if debug then
-            print("[AUDIO] " .. name .. " reset+accepted")
-        end
-
-        return true, "reset accepted"
-    end
-
-    if not ok2 then
-        st.errors = st.errors + 1
-        st.last = "reset error"
-        if debug then
-            print("[AUDIO] " .. name .. " reset retry error; skipped")
-        end
-    else
-        st.last = "skipped after reset"
-        if debug then
-            print("[AUDIO] " .. name .. " still full; skipped chunk")
-        end
-    end
-
-    return true, "skipped"
-end
-
-local function playAudioBufferOnAll(buffer, volume, debug, shouldContinue)
-    -- NO-HOLD ordered broadcast:
-    -- Each chunk is offered to each visible speaker once in fixed order.
-    -- A full/lagging speaker is reset and retried once.
-    -- If it still cannot accept, that speaker drops that chunk.
-    -- No waiting for speaker_audio_empty. No speaker can stall the broadcast.
-    scanSpeakers()
-
-    if #citySpeakers == 0 then
-        return false, "No visible speaker peripherals."
-    end
-
-    if debug then
-        print("[AUDIO] NO-HOLD ordered broadcast to " .. tostring(#citySpeakers) .. " speaker(s).")
+    local n = tonumber(ref)
+    if n and citySpeakers[n] then
+        return citySpeakers[n], nil
     end
 
     for _, item in ipairs(citySpeakers) do
+        if tostring(item.name) == ref then
+            return item, nil
+        end
+    end
+
+    return nil, "No visible speaker matches '" .. tostring(ref) .. "'."
+end
+
+local function dropSpeakerCommand(ref)
+    local item, err = resolveSpeakerRef(ref)
+
+    if not item then
+        print(err)
+        return
+    end
+
+    quarantineSpeaker(item.name, "manual drop")
+    pcall(function() item.speaker.stop() end)
+end
+
+local function useSpeakerCommand(ref)
+    local item, err = resolveSpeakerRef(ref)
+
+    if not item then
+        print(err)
+        return
+    end
+
+    speakerQuarantine[tostring(item.name)] = nil
+    print("Speaker restored to broadcast list: " .. tostring(item.name))
+end
+
+local function printSpeakerQuarantine()
+    scanSpeakers()
+
+    print("")
+    line()
+    print("SPEAKER BROADCAST TARGETS")
+    print("Mode: stable quarantine. Dropped speakers receive no audio until restored.")
+    print("")
+
+    local active = 0
+    local dropped = 0
+
+    for i, item in ipairs(citySpeakers) do
+        local name = tostring(item.name)
+        local reason = speakerQuarantine[name]
+
+        if reason then
+            dropped = dropped + 1
+            print(tostring(i) .. ". " .. name .. "  DROPPED  " .. tostring(reason))
+        else
+            active = active + 1
+            print(tostring(i) .. ". " .. name .. "  active")
+        end
+    end
+
+    print("")
+    print("Active: " .. tostring(active) .. " | Dropped: " .. tostring(dropped) .. " | Visible: " .. tostring(#citySpeakers))
+    print("")
+    print("Drop a dead speaker: spdrop <number/name>")
+    print("Restore a speaker:   spuse <number/name>")
+    print("Clear all drops:     spresume")
+    line()
+    print("")
+end
+
+local function activeBroadcastSpeakers()
+    scanSpeakers()
+
+    local list = {}
+
+    for _, item in ipairs(citySpeakers) do
+        if not isSpeakerQuarantined(item.name) then
+            list[#list + 1] = item
+        end
+    end
+
+    return list
+end
+
+local function waitForSpeakerEmpty(speakerName, timeoutSeconds, shouldContinue)
+    local timer = os.startTimer(timeoutSeconds or SPEAKER_LAG_TIMEOUT)
+
+    while true do
         if shouldContinue and not shouldContinue() then
             return false, "cancelled"
         end
 
-        playAudioBufferOnSpeakerNoHold(item, buffer, volume, debug, shouldContinue)
+        local event, p1 = os.pullEvent()
+
+        if event == "speaker_audio_empty" then
+            if p1 == nil or tostring(p1) == tostring(speakerName) then
+                return true
+            end
+
+        elseif event == "timer" and p1 == timer then
+            return false, "timeout waiting for " .. tostring(speakerName)
+
+        elseif event == "peripheral_detach" then
+            return false, "peripheral detached while waiting for " .. tostring(speakerName)
+        end
+    end
+end
+
+local function playAudioBufferOnSpeakerStable(item, buffer, volume, debug, shouldContinue)
+    local name = tostring(item.name)
+
+    if isSpeakerQuarantined(name) then
+        return true, "dropped"
+    end
+
+    for attempt = 1, SPEAKER_MAX_FULL_RETRIES do
+        if shouldContinue and not shouldContinue() then
+            return false, "cancelled"
+        end
+
+        local ok, accepted = pcall(function()
+            return item.speaker.playAudio(buffer, volume or 1)
+        end)
+
+        if ok and accepted then
+            if debug then
+                print("[AUDIO] " .. name .. " accepted")
+            end
+            return true, "accepted"
+        end
+
+        if not ok then
+            quarantineSpeaker(name, "playAudio error: " .. tostring(accepted))
+            pcall(function() item.speaker.stop() end)
+            return true, "quarantined"
+        end
+
+        if debug then
+            print("[AUDIO] " .. name .. " full; short catch-up wait")
+        end
+
+        local waited, waitErr = waitForSpeakerEmpty(name, SPEAKER_LAG_TIMEOUT, shouldContinue)
+
+        if not waited then
+            quarantineSpeaker(name, waitErr or "lag timeout")
+            pcall(function() item.speaker.stop() end)
+            return true, "quarantined"
+        end
+    end
+
+    quarantineSpeaker(name, "repeated full buffer")
+    pcall(function() item.speaker.stop() end)
+    return true, "quarantined"
+end
+
+local function playAudioBufferOnAll(buffer, volume, debug, shouldContinue)
+    -- Stable quarantine broadcast:
+    -- Active speakers get every chunk in order.
+    -- A bad/lagging speaker is dropped from the stream, not partially fed.
+    local targets = activeBroadcastSpeakers()
+
+    if #targets == 0 then
+        return false, "No active broadcast speakers."
+    end
+
+    if debug then
+        print("[AUDIO] Stable broadcast to " .. tostring(#targets) .. "/" .. tostring(#citySpeakers) .. " speaker(s).")
+    end
+
+    for _, item in ipairs(targets) do
+        if shouldContinue and not shouldContinue() then
+            return false, "cancelled"
+        end
+
+        local ok, err = playAudioBufferOnSpeakerStable(item, buffer, volume, debug, shouldContinue)
+
+        if not ok then
+            return false, err
+        end
     end
 
     return true
@@ -2277,8 +2311,10 @@ local function bootScreen()
     print("  morning     - force fresh GPT city broadcast")
     print("  speakers    - rescan/list visible speakers")
     print("  speakerorder - show ordered broadcast order")
-    print("  spstats    - show accepted/skipped speaker stats")
-    print("  spmode nohold - full speakers reset once, then skip")
+    print("  spquarantine - show active/dropped speakers")
+    print("  spdrop 3   - drop a dead speaker from broadcast")
+    print("  spuse 3    - restore a dropped speaker")
+    print("  spresume   - clear all dropped speakers")
     print("  peripherals - list every visible peripheral")
     print("  monitors    - refresh/list monitor mirror")
     print("  montest     - test monitor mirror")
@@ -2344,19 +2380,23 @@ local function chatLoop()
             elseif lower == "speakerorder" or lower == "sporder" then
                 printSpeakerOrder()
 
-            elseif lower == "spstats" or lower == "speakerstats" then
-                printSpeakerRuntimeStats()
+            elseif lower == "spquarantine" or lower == "spbad" or lower == "speakerquarantine" then
+                printSpeakerQuarantine()
 
-            elseif lower == "spstats clear" or lower == "speakerstats clear" then
-                resetSpeakerStats()
+            elseif lower == "spresume" or lower == "spclear" or lower == "speakerresume" then
+                clearSpeakerQuarantine()
 
-            elseif lower == "spmode wait" then
-                SPEAKER_SKIP_LAGGING = true
-                print("WAIT mode is disabled in this build. NO-HOLD mode remains active.")
+            elseif lower:match("^spdrop%s+") or lower:match("^speaker%s+drop%s+") then
+                local ref =
+                    input:match("^spdrop%s+(.+)$") or
+                    input:match("^speaker%s+drop%s+(.+)$")
+                dropSpeakerCommand(ref)
 
-            elseif lower == "spmode skip" or lower == "spmode nohold" then
-                SPEAKER_SKIP_LAGGING = true
-                print("Speaker audio mode set to NO-HOLD. Full speakers reset once, then skip the chunk.")
+            elseif lower:match("^spuse%s+") or lower:match("^speaker%s+use%s+") then
+                local ref =
+                    input:match("^spuse%s+(.+)$") or
+                    input:match("^speaker%s+use%s+(.+)$")
+                useSpeakerCommand(ref)
 
             elseif lower == "peripherals" then
                 printAllPeripherals()
@@ -2374,7 +2414,7 @@ local function chatLoop()
                 print("Morning broadcast language: angry Mandarin only")
                 print("TTS provider: " .. tostring(TTS_PROVIDER))
                 print("OpenAI TTS voice: " .. tostring(OPENAI_TTS_VOICE))
-                print("Speaker audio mode: NO-HOLD ordered broadcast")
+                print("Speaker audio mode: stable quarantine broadcast")
 
             elseif lower == "update" or lower == "selfupdate" then
                 print("Forcing GitHub self-update from:")
