@@ -8,7 +8,7 @@
 -- The node does not use OpenAI, JarvisKey, or audio packet streams.
 -- It only uses HTTP to fetch the public TTS/music audio it was told to play.
 
-local VERSION = "3.0.5-command-node-gpt-tts-minimal-fix"
+local VERSION = "3.0.6-command-node-gpt-tts-verbose"
 local PROTOCOL = "JARVIS_PA_V1"
 
 local NODE_LABEL = os.getComputerLabel() or ("SpeakerNode-" .. tostring(os.getComputerID()))
@@ -27,6 +27,10 @@ local OPENAI_TTS_RESPONSE_FORMAT = "pcm"
 local OPENAI_TTS_PCM_CHUNK_SIZE = 8192
 local OPENAI_TTS_TEXT_CHUNK_MAX = 300
 local OPENAI_TTS_SPEED = 1.0
+
+-- Terminal logging. This does not change playback.
+local VERBOSE_LOGGING = true
+local LOG_EVERY_AUDIO_CHUNKS = 10
 
 -- OpenAI PCM is 24 kHz mono. CC speakers expect 48 kHz.
 -- Duplicate each sample once to keep the correct speed.
@@ -67,6 +71,40 @@ local function readAll(path)
 
     return data
 end
+
+local function shortText(s, maxLen)
+    s = tostring(s or "")
+    maxLen = maxLen or 80
+
+    s = s:gsub("\n", " "):gsub("\r", " ")
+
+    if #s > maxLen then
+        return s:sub(1, maxLen) .. "..."
+    end
+
+    return s
+end
+
+local function log(section, msg)
+    if VERBOSE_LOGGING then
+        print("[NODE][" .. tostring(section) .. "] " .. tostring(msg))
+    end
+end
+
+local function responseCode(handle)
+    if handle and handle.getResponseCode then
+        local ok, code = pcall(function()
+            return handle.getResponseCode()
+        end)
+
+        if ok and code then
+            return tonumber(code) or tostring(code)
+        end
+    end
+
+    return "?"
+end
+
 
 local function peripheralHasType(name, wanted)
     if not peripheral or not peripheral.getType then
@@ -403,16 +441,24 @@ local function speakOpenAIChunk(text, volume, token, voice, model, instructions)
         return false, "HTTP POST unavailable on node."
     end
 
+    local usedVoice = voice or OPENAI_TTS_VOICE
+    local usedModel = model or OPENAI_TTS_MODEL
+
+    log("TTS", "Request start")
+    log("TTS", "Text chars=" .. tostring(#tostring(text or "")) .. " preview=\"" .. shortText(text, 90) .. "\"")
+    log("TTS", "Voice=" .. tostring(usedVoice) .. " | model=" .. tostring(usedModel) .. " | volume=" .. tostring(volume or TTS_VOLUME))
+    log("TTS", "PCM read=" .. tostring(OPENAI_TTS_PCM_CHUNK_SIZE) .. " bytes | speed=" .. tostring(OPENAI_TTS_SPEED) .. " | conversion=24k->48k")
+
     local body = textutils.serializeJSON({
-        model = model or OPENAI_TTS_MODEL,
-        voice = voice or OPENAI_TTS_VOICE,
+        model = usedModel,
+        voice = usedVoice,
         input = text,
         instructions = instructions,
         response_format = OPENAI_TTS_RESPONSE_FORMAT,
         speed = OPENAI_TTS_SPEED,
     })
 
-    print("[NODE] GPT TTS voice=" .. tostring(voice or OPENAI_TTS_VOICE))
+    log("TTS", "HTTP POST /v1/audio/speech")
 
     local response = http.post(
         "https://api.openai.com/v1/audio/speech",
@@ -429,37 +475,46 @@ local function speakOpenAIChunk(text, volume, token, voice, model, instructions)
         return false, "OpenAI TTS HTTP request failed."
     end
 
-    local code = 200
-    if response.getResponseCode then
-        local okCode, c = pcall(function()
-            return response.getResponseCode()
-        end)
+    local code = responseCode(response)
+    log("TTS", "OpenAI HTTP " .. tostring(code))
 
-        if okCode and c then
-            code = tonumber(c) or c
-        end
-    end
-
-    if tostring(code) ~= "200" then
+    if code ~= "?" and tonumber(code) and tonumber(code) ~= 200 then
         local errBody = ""
         pcall(function()
             errBody = response.readAll() or ""
         end)
         response.close()
-        return false, "OpenAI TTS HTTP " .. tostring(code) .. ": " .. tostring(errBody):sub(1, 200)
+        return false, "OpenAI TTS HTTP " .. tostring(code) .. ": " .. shortText(errBody, 200)
     end
 
     local carryByte = nil
+    local chunks = 0
+    local rawBytes = 0
+    local speakerSamples = 0
 
     while shouldContinue(token) do
         local raw = response.read(OPENAI_TTS_PCM_CHUNK_SIZE)
         if not raw then break end
 
+        chunks = chunks + 1
+        rawBytes = rawBytes + #raw
+
         local audio
         audio, carryByte = pcm16leToSpeakerBuffer(raw, carryByte)
+        speakerSamples = speakerSamples + #audio
+
+        if chunks == 1 then
+            log("TTS", "First PCM chunk bytes=" .. tostring(#raw) .. " speakerSamples=" .. tostring(#audio))
+        elseif chunks % LOG_EVERY_AUDIO_CHUNKS == 0 then
+            log("TTS", "Progress chunks=" .. tostring(chunks) .. " rawBytes=" .. tostring(rawBytes) .. " speakerSamples=" .. tostring(speakerSamples))
+        end
 
         if #audio > 0 then
             local ok, err = playBufferOnAll(audio, volume or TTS_VOLUME)
+
+            if chunks == 1 then
+                log("TTS", "First speaker buffer: " .. (ok and "accepted" or ("failed: " .. tostring(err))))
+            end
 
             if not ok then
                 response.close()
@@ -474,14 +529,17 @@ local function speakOpenAIChunk(text, volume, token, voice, model, instructions)
         return false, "cancelled"
     end
 
+    log("TTS", "Complete chunks=" .. tostring(chunks) .. " rawBytes=" .. tostring(rawBytes) .. " speakerSamples=" .. tostring(speakerSamples))
     return true, "GPT TTS played"
 end
 
 
 local function streamDfpwmUrl(url, volume, token, label)
     url = trim(url or "")
+    label = tostring(label or "audio")
 
     if url == "" then
+        log("MUSIC", label .. " skipped: no URL")
         return true, "no url"
     end
 
@@ -492,22 +550,53 @@ local function streamDfpwmUrl(url, volume, token, label)
     local dfpwm = require("cc.audio.dfpwm")
     local decoder = dfpwm.make_decoder()
 
-    print("[NODE] Opening " .. tostring(label or "audio") .. "...")
+    log("MUSIC", "Opening " .. label)
+    log("MUSIC", "URL: " .. shortText(url, 110))
+    log("MUSIC", "Chunk size: " .. tostring(AUDIO_CHUNK_SIZE) .. " bytes | volume=" .. tostring(volume or 1))
+
     local response = http.get(url, nil, true)
 
     if not response then
-        return false, "HTTP request failed for " .. tostring(label or url)
+        return false, "HTTP request failed for " .. label
+    end
+
+    local code = responseCode(response)
+    log("MUSIC", "HTTP " .. tostring(code))
+
+    if code ~= "?" and tonumber(code) and tonumber(code) ~= 200 then
+        local errBody = ""
+        pcall(function()
+            errBody = response.readAll() or ""
+        end)
+        response.close()
+        return false, label .. " HTTP " .. tostring(code) .. ": " .. shortText(errBody, 180)
     end
 
     local chunks = 0
+    local totalBytes = 0
+    local totalSamples = 0
 
     while shouldContinue(token) do
         local chunk = response.read(AUDIO_CHUNK_SIZE)
         if not chunk then break end
 
         chunks = chunks + 1
+        totalBytes = totalBytes + #chunk
+
         local audio = decoder(chunk)
+        totalSamples = totalSamples + #audio
+
+        if chunks == 1 then
+            log("MUSIC", "First chunk bytes=" .. tostring(#chunk) .. " decodedSamples=" .. tostring(#audio))
+        elseif chunks % LOG_EVERY_AUDIO_CHUNKS == 0 then
+            log("MUSIC", "Progress chunks=" .. tostring(chunks) .. " bytes=" .. tostring(totalBytes) .. " samples=" .. tostring(totalSamples))
+        end
+
         local ok, err = playBufferOnAll(audio, volume or 1)
+
+        if chunks == 1 then
+            log("MUSIC", "First speaker buffer: " .. (ok and "accepted" or ("failed: " .. tostring(err))))
+        end
 
         if not ok then
             response.close()
@@ -521,7 +610,7 @@ local function streamDfpwmUrl(url, volume, token, label)
         return false, "cancelled"
     end
 
-    print("[NODE] Finished " .. tostring(label or "audio") .. ". Chunks=" .. tostring(chunks))
+    log("MUSIC", "Finished " .. label .. " | chunks=" .. tostring(chunks) .. " bytes=" .. tostring(totalBytes) .. " samples=" .. tostring(totalSamples))
     return true, "played"
 end
 
@@ -650,10 +739,15 @@ local function workerLoop()
 
             if job.type == "program" then
                 print("[NODE] Program from " .. tostring(job.sender) .. ": TTS then music.")
+                log("JOB", "TTS chars=" .. tostring(#tostring(job.tts_text or "")) .. " | music=" .. tostring(job.music_name or "track"))
+                log("JOB", "Music URL=" .. shortText(job.music_url, 110))
                 ok, result = playTtsText(job.tts_text, job.tts_volume, job.token, job.tts_voice, job.tts_model, job.tts_instructions)
 
                 if ok and shouldContinue(job.token) then
+                    log("JOB", "TTS finished; starting music.")
                     ok, result = playMusicUrl(job.music_url, job.music_name, job.music_volume, job.token)
+                else
+                    log("JOB", "Music skipped because TTS failed/cancelled: " .. tostring(result))
                 end
 
             elseif job.type == "speak" then
@@ -666,7 +760,7 @@ local function workerLoop()
             end
 
             ack(job.sender, job.command_id, ok, result)
-            print("[NODE] Job finished: " .. tostring(result))
+            print("[NODE] Job finished: " .. tostring(ok and "OK" or "FAILED") .. " | " .. tostring(result))
         end
     end
 end
@@ -687,6 +781,7 @@ local function commandLoop()
             print("HTTP for public audio URLs: " .. boolText(http and http.get))
             print("OpenAI key: " .. boolText(API_KEY ~= nil))
             print("OpenAI voice default: " .. OPENAI_TTS_VOICE)
+            print("Verbose logging: " .. boolText(VERBOSE_LOGGING))
             print("Speakers: " .. tostring(#localSpeakers))
             for i, item in ipairs(localSpeakers) do
                 print("  " .. tostring(i) .. ". " .. tostring(item.name))
@@ -698,6 +793,10 @@ local function commandLoop()
         elseif lower == "reloadkey" then
             API_KEY = loadKey()
             print("OpenAI key: " .. boolText(API_KEY ~= nil))
+
+        elseif lower == "verbose" then
+            VERBOSE_LOGGING = not VERBOSE_LOGGING
+            print("Verbose logging: " .. boolText(VERBOSE_LOGGING))
 
         elseif lower == "stop" then
             cancelToken = cancelToken + 1
@@ -714,7 +813,7 @@ local function commandLoop()
             error("Terminated", 0)
 
         elseif lower ~= "" then
-            print("Commands: status, speakers, chime, reloadkey, stop, clear, exit")
+            print("Commands: status, speakers, chime, reloadkey, verbose, stop, clear, exit")
         end
     end
 end
