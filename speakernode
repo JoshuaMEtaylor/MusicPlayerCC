@@ -8,7 +8,7 @@
 -- The node does not use OpenAI, JarvisKey, or audio packet streams.
 -- It only uses HTTP to fetch the public TTS/music audio it was told to play.
 
-local VERSION = "3.0.2-command-program-node-gpt-tts-speed-fix"
+local VERSION = "3.0.3-command-program-node-gpt-tts-speed-fixed-clean"
 local PROTOCOL = "JARVIS_PA_V1"
 
 local NODE_LABEL = os.getComputerLabel() or ("SpeakerNode-" .. tostring(os.getComputerID()))
@@ -17,21 +17,20 @@ local TTS_VOLUME = 1.0
 local MUSIC_VOLUME = 1.0
 local AUDIO_CHUNK_SIZE = 16 * 1024
 
--- GPT/OpenAI TTS only. No GPT/chat calls are made by this node.
--- The main JARVIS still generates the text and picks the music.
--- This node only turns the already-supplied text into audio using the same voice
--- when JarvisKey.lua is present.
+-- OpenAI/GPT TTS only. No GPT/chat calls are made by this node.
+-- Main JARVIS still generates the text and chooses the music.
+-- This node only turns the supplied text into audio using OpenAI TTS.
 local KEY_FILE = "JarvisKey.lua"
 local OPENAI_TTS_MODEL = "gpt-4o-mini-tts"
 local OPENAI_TTS_VOICE = "cedar"
 local OPENAI_TTS_RESPONSE_FORMAT = "pcm"
 local OPENAI_TTS_PCM_CHUNK_SIZE = 65536
 
--- OpenAI raw PCM TTS is 24 kHz mono PCM.
--- ComputerCraft speakers play buffers at 48 kHz.
--- Therefore each OpenAI sample must become two CC speaker samples.
+-- OpenAI TTS PCM is 24 kHz mono; ComputerCraft speakers expect 48 kHz.
+-- Duplicate each sample to preserve correct playback speed.
 local OPENAI_TTS_SOURCE_RATE = 24000
 local CC_SPEAKER_RATE = 48000
+
 local OPENAI_TTS_INSTRUCTIONS = [=[
 Speak clearly and naturally over a Minecraft public-address speaker.
 Use the same official JARVIS announcer style as the main terminal.
@@ -321,10 +320,7 @@ end
 
 local function pcm16leToSpeakerBuffer(chunk)
     -- Convert OpenAI 16-bit little-endian 24 kHz mono PCM into
-    -- ComputerCraft's signed 8-bit 48 kHz speaker buffer.
-    --
-    -- The important part is the 24 kHz -> 48 kHz upsample.
-    -- Without this, the TTS plays too fast.
+    -- ComputerCraft signed 8-bit 48 kHz speaker samples.
     local out = {}
     local oi = 1
 
@@ -340,8 +336,7 @@ local function pcm16leToSpeakerBuffer(chunk)
         if v > 127 then v = 127 end
         if v < -128 then v = -128 end
 
-        -- 24 kHz source -> 48 kHz CC speaker rate.
-        -- Duplicate each sample once. This preserves duration/speed.
+        -- 24 kHz -> 48 kHz: duplicate each sample once.
         out[oi] = v
         out[oi + 1] = v
         oi = oi + 2
@@ -378,11 +373,11 @@ end
 
 local function speakOpenAIChunk(text, voice, model, instructions, volume, token)
     if not API_KEY then
-        return false, "OpenAI key missing on node."
+        return false, "OpenAI key missing on node. Add JarvisKey.lua or run reloadkey."
     end
 
     if not http or not http.post then
-        return false, "HTTP unavailable on node."
+        return false, "HTTP POST unavailable on node."
     end
 
     local payload = textutils.serializeJSON({
@@ -484,10 +479,6 @@ local function playTtsText(text, volume, token, voice, model, instructions)
 
     if text == "" then
         return true, "no TTS text"
-    end
-
-    if not API_KEY then
-        return false, "OpenAI key missing on node. Add JarvisKey.lua or run reloadkey."
     end
 
     local chunks = splitSpeechChunks(text, 700)
