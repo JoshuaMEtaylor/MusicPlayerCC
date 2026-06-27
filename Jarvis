@@ -31,7 +31,7 @@
 --   stopmusic
 -- =============================================================================
 
-local VERSION = "3.4.0-selfupdate-restored"
+local VERSION = "3.5.0-auto-monitor-fit"
 local args = {...}
 
 -- =============================================================================
@@ -206,6 +206,16 @@ local nativeWrite = write
 local mirrorMonitors = {}
 local mirrorStarted = false
 
+local function forceMonitorFit(mon)
+    if not mon then return end
+
+    -- 0.5 is the smallest ComputerCraft monitor text scale.
+    -- This makes larger monitors show more text instead of huge stretched text.
+    pcall(function()
+        mon.setTextScale(0.5)
+    end)
+end
+
 local function periphHasType(name, wanted)
     if peripheral.hasType then
         local ok, result = pcall(function()
@@ -240,11 +250,12 @@ local function mirrorScanMonitors()
 
             if mon and mon.getSize then
                 pcall(function()
-                    mon.setTextScale(MONITOR_TEXT_SCALE)
+                    forceMonitorFit(mon)
                     mon.clear()
                     mon.setCursorPos(1, 1)
                 end)
 
+                forceMonitorFit(mon)
                 local w, h = mon.getSize()
 
                 mirrorMonitors[#mirrorMonitors + 1] = {
@@ -348,6 +359,7 @@ end
 local function refreshMonitorMirror()
     mirrorScanMonitors()
     print("Monitor mirror refreshed. Visible monitors: " .. tostring(#mirrorMonitors))
+    print("Monitor auto-fit: 0.5 text scale forced on every visible monitor.")
 
     for i, item in ipairs(mirrorMonitors) do
         print(tostring(i) .. ". " .. tostring(item.name) .. " " .. tostring(item.width) .. "x" .. tostring(item.height))
@@ -357,6 +369,7 @@ end
 local function monitorMirrorTest()
     refreshMonitorMirror()
     print("MONITOR TEST: If you can read this on the large monitor, mirroring is working.")
+    print("Monitor auto-fit: text scale forced to 0.5 so large monitors show more text, not giant text.")
 end
 
 local function encodePath(path)
