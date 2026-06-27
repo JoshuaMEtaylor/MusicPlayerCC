@@ -31,7 +31,7 @@
 --   stopmusic
 -- =============================================================================
 
-local VERSION = "4.4.1-hybrid-synced-checked"
+local VERSION = "4.6.0-command-pa-controller"
 local args = {...}
 
 -- =============================================================================
@@ -49,13 +49,6 @@ local PA_NODE_PROTOCOL = "JARVIS_PA_V1"
 local PA_NODE_DISCOVERY_TIMEOUT = 1.5
 local PA_NODE_ACK_TIMEOUT = 2.0
 local PA_NODE_PRESTART_DELAY = 0.15
-
--- Dumb node mode:
--- JARVIS does all HTTP/TTS/music decoding.
--- Nodes only receive raw speaker audio buffers and play them locally.
-local PA_NODE_AUDIO_PACKET_SAMPLES = 2048
-local PA_NODE_AUDIO_PACKET_GAP = 0
-local PA_NODE_START_DELAY = 0.15
 
 -- Mirror literally all terminal print/write output to every visible monitor.
 local MONITOR_MIRROR_ENABLED = true
@@ -685,8 +678,6 @@ end
 local citySpeakers = {}
 local speakerNodes = {}
 local paCommandCounter = 0
-local paAudioStreamId = "boot"
-local paNodeStreamArmed = false
 local droppedSpeakers = {}
 
 local function peripheralIsSpeaker(name)
@@ -950,78 +941,6 @@ local function nodeTestChime()
     return sendNodeCommand({ type = "test_chime", volume = 1 }, PA_NODE_ACK_TIMEOUT, true)
 end
 
-local function newNodeAudioStream(reason)
-    paAudioStreamId = nextPaCommandId("stream")
-    paNodeStreamArmed = true
-
-    print("[NODE] New raw audio stream: " .. paAudioStreamId .. (reason and (" | " .. tostring(reason)) or ""))
-
-    if rednet and rednet.broadcast then
-        openAllPaModems()
-        rednet.broadcast({
-            type = "stream_start",
-            command_id = nextPaCommandId("stream_start"),
-            stream_id = paAudioStreamId,
-            reason = tostring(reason or ""),
-        }, PA_NODE_PROTOCOL)
-    end
-
-    return paAudioStreamId
-end
-
-local function sendRawAudioToNodes(buffer, volume)
-    if type(buffer) ~= "table" then
-        return false
-    end
-
-    if not rednet or not rednet.broadcast then
-        return false
-    end
-
-    openAllPaModems()
-
-    local total = #buffer
-    local pos = 1
-
-    while pos <= total do
-        local packet = {}
-        local last = math.min(total, pos + PA_NODE_AUDIO_PACKET_SAMPLES - 1)
-
-        for i = pos, last do
-            packet[#packet + 1] = buffer[i]
-        end
-
-        rednet.broadcast({
-            type = "audio",
-            stream_id = paAudioStreamId,
-            buffer = packet,
-            volume = volume or 1,
-        }, PA_NODE_PROTOCOL)
-
-        pos = last + 1
-
-        if PA_NODE_AUDIO_PACKET_GAP and PA_NODE_AUDIO_PACKET_GAP > 0 then
-            sleep(PA_NODE_AUDIO_PACKET_GAP)
-        end
-    end
-
-    -- First audio buffer of a new stream is pre-sent to nodes.
-    -- Then we release the nodes with stream_play and briefly delay direct speakers.
-    if paNodeStreamArmed then
-        paNodeStreamArmed = false
-
-        rednet.broadcast({
-            type = "stream_play",
-            command_id = nextPaCommandId("stream_play"),
-            stream_id = paAudioStreamId,
-        }, PA_NODE_PROTOCOL)
-
-        sleep(PA_NODE_START_DELAY)
-    end
-
-    return true
-end
-
 local function nodeUpdateAll()
     return sendNodeCommand({ type = "update" }, PA_NODE_ACK_TIMEOUT, true)
 end
@@ -1046,6 +965,28 @@ local function nodeMusic(track)
         volume = MUSIC_VOLUME,
     }, PA_NODE_ACK_TIMEOUT, true)
 end
+
+local function nodeProgram(ttsText, track, language)
+    if not track then
+        return sendNodeCommand({
+            type = "speak",
+            text = tostring(ttsText or ""),
+            volume = TTS_VOLUME,
+            language = language or "normal",
+        }, PA_NODE_ACK_TIMEOUT, true)
+    end
+
+    return sendNodeCommand({
+        type = "program",
+        tts_text = tostring(ttsText or ""),
+        language = language or "normal",
+        tts_volume = TTS_VOLUME,
+        music_url = tostring(track.url or ""),
+        music_name = tostring(track.name or "track"),
+        music_volume = MUSIC_VOLUME,
+    }, PA_NODE_ACK_TIMEOUT, true)
+end
+
 
 local function loadDroppedSpeakers()
     droppedSpeakers = {}
@@ -1317,21 +1258,13 @@ local function playAudioBufferOnSpeaker(item, buffer, volume, debug, shouldConti
 end
 
 local function playAudioBufferOnAll(buffer, volume, debug, shouldContinue)
-    -- Hybrid raw-audio broadcast:
-    -- JARVIS sends every decoded audio buffer to wireless dumb nodes,
-    -- then plays the same buffer on direct wired speakers.
-    sendRawAudioToNodes(buffer, volume)
-
     -- Smooth active-only ordered broadcast:
     -- dead speakers should be manually removed with spdrop.
     -- active speakers receive every buffer continuously.
     local targets = activeBroadcastSpeakers()
 
     if #targets == 0 then
-        if debug then
-            print("[AUDIO] No active direct wired speakers; node audio was still broadcast.")
-        end
-        return true
+        return false, "No active broadcast speakers. Run spresume or spuse <speaker>."
     end
 
     if debug then
@@ -2025,9 +1958,16 @@ local function speakAsync(text, ttsInstructions)
     pcall(function()
         parallel.waitForAny(
             function()
-                newNodeAudioStream("chat TTS")
-                local ok, err = speakToCity(payload, false, ttsInstructions)
-                if not ok then print("TTS warning: " .. tostring(err)) end
+                parallel.waitForAll(
+                    function()
+                        nodeSpeak(payload, "normal")
+                    end,
+                    function()
+                        sleep(PA_NODE_PRESTART_DELAY)
+                        local ok, err = speakToCity(payload, false, ttsInstructions)
+                        if not ok then print("TTS warning: " .. tostring(err)) end
+                    end
+                )
             end,
             function()
                 sleep(60)
@@ -2292,7 +2232,7 @@ local function printTracks()
     print("")
 end
 
-local function playMusicTrack(track)
+local function playMusicTrack(track, sendNodes)
     if not track then
         print("[MUSIC] No track selected.")
         return false
@@ -2306,8 +2246,13 @@ local function playMusicTrack(track)
     end
 
     print("[MUSIC] Opening stream: " .. tostring(track.name))
-    print("[MUSIC] Sending raw music audio to wireless speaker nodes...")
-    newNodeAudioStream("music: " .. tostring(track.name))
+
+    if sendNodes ~= false then
+        print("[MUSIC] Sending music command to wireless speaker nodes...")
+        nodeMusic(track)
+        sleep(PA_NODE_PRESTART_DELAY)
+    end
+
     print("[MUSIC] Broadcasting to direct wired speakers: " .. tostring(#activeBroadcastSpeakers()) .. "/" .. tostring(#citySpeakers) .. " active speaker(s).")
 
     local handle = http.get(track.url, {
@@ -2365,22 +2310,32 @@ local function playMusicTrack(track)
     return true
 end
 
-local function playRandomMusic()
+local function pickRandomMusicTrack()
     local ok, result = ensureTracks()
 
     if not ok then
         print("[MUSIC] Track load failed: " .. tostring(result))
-        return false
+        return nil
     end
 
     if #musicTracks == 0 then
         print("[MUSIC] No tracks loaded.")
-        return false
+        return nil
     end
 
     local track = musicTracks[math.random(1, #musicTracks)]
     print("Daily music selection: " .. tostring(track.name))
-    return playMusicTrack(track)
+    return track
+end
+
+local function playRandomMusic()
+    local track = pickRandomMusicTrack()
+
+    if not track then
+        return false
+    end
+
+    return playMusicTrack(track, true)
 end
 
 local function stopMusic(reason)
@@ -2569,17 +2524,22 @@ local function printMorningBroadcast(forced)
         print("")
     end
 
-    print("[NODE] Sending raw morning TTS audio to wireless speaker nodes...")
-    newNodeAudioStream("morning TTS")
+    print("")
+    print("Selecting daily patriotic music through JARVIS...")
+    local morningTrack = pickRandomMusicTrack()
+
+    print("[NODE] Sending one programme command to wireless speaker nodes: TTS then music.")
+    nodeProgram(speech, morningTrack, "mandarin_morning")
+    sleep(PA_NODE_PRESTART_DELAY)
 
     local okSpeak, speakErr = speakToCity(speech, false, MORNING_TTS_INSTRUCTIONS)
     if not okSpeak then
         print("TTS warning: " .. tostring(speakErr))
     end
 
-    print("")
-    print("Selecting daily patriotic music through JARVIS...")
-    playRandomMusic()
+    if morningTrack then
+        playMusicTrack(morningTrack, false)
+    end
 
     if not forced then
         appendMorningHistory(c.absolute_day, speech)
@@ -2786,7 +2746,7 @@ local function chatLoop()
                 print("Morning broadcast language: angry Mandarin only")
                 print("TTS provider: " .. tostring(TTS_PROVIDER))
                 print("OpenAI TTS voice: " .. tostring(OPENAI_TTS_VOICE))
-                print("Speaker audio mode: hybrid synced direct wired + raw-audio dumb nodes")
+                print("Speaker audio mode: command-based PA nodes + direct wired speakers")
 
             elseif lower == "update" or lower == "selfupdate" then
                 print("Forcing GitHub self-update from:")
