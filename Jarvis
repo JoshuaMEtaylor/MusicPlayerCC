@@ -31,7 +31,7 @@
 --   stopmusic
 -- =============================================================================
 
-local VERSION = "3.6.0-real-audio-speaker-test"
+local VERSION = "3.6.1-real-audio-test-checked"
 local args = {...}
 
 -- =============================================================================
@@ -56,6 +56,10 @@ local TTS_VOLUME = 1.0
 local TTS_SINGLE_REQUEST_MAX_CHARS = 600
 local TTS_TOTAL_MAX_CHARS = 2600
 local AUDIO_WAIT_TIMEOUT = 0.35
+local SPEAKER_TEST_TIMEOUT = 8
+local SPEAKER_AUDIBLE_TEST_HZ = 660
+local SPEAKER_AUDIBLE_TEST_VOLUME = 1.0
+local SPEAKER_BEACON_SECONDS = 12
 
 -- OpenAI neural TTS.
 -- Voices worth trying: cedar, marin, onyx, ballad, verse, coral, nova.
@@ -885,6 +889,28 @@ local function makeSilentProbeBuffer()
     return buffer
 end
 
+
+local function makeAudibleToneBuffer(freq, seconds)
+    -- Real audible square-wave buffer for speaker.playAudio.
+    -- This is not a silent ping. If the speaker/player/chunk can output audio,
+    -- this should be heard as a clear tone.
+    local sampleRate = 48000
+    local duration = tonumber(seconds) or 0.45
+    local count = math.floor(sampleRate * duration)
+    local period = math.max(1, math.floor(sampleRate / (tonumber(freq) or SPEAKER_AUDIBLE_TEST_HZ)))
+    local buffer = {}
+
+    for i = 1, count do
+        if (i % period) < (period / 2) then
+            buffer[i] = 80
+        else
+            buffer[i] = -80
+        end
+    end
+
+    return buffer
+end
+
 local function makeReportRows()
     scanSpeakers()
 
@@ -974,7 +1000,11 @@ local function speakerPassFailReport(title, audible)
         return false, rows
     end
 
-    printReportTable(title or "SPEAKER TEST REPORT", rows, "Starting speaker test...")
+    if audible then
+        printReportTable(title or "SPEAKER REAL AUDIO REPORT", rows, "Sending REAL audible tone buffer to every speaker.")
+    else
+        printReportTable(title or "SPEAKER PING REPORT", rows, "Sending silent buffer handshake to every speaker.")
+    end
 
     -- Clear all current speaker buffers first.
     for _, item in ipairs(citySpeakers) do
@@ -983,11 +1013,17 @@ local function speakerPassFailReport(title, audible)
         end)
     end
 
-    sleep(0.2)
+    sleep(0.25)
 
     local pending = {}
     local pendingCount = 0
-    local probe = makeSilentProbeBuffer()
+    local buffer
+
+    if audible then
+        buffer = makeAudibleToneBuffer(SPEAKER_AUDIBLE_TEST_HZ, 0.45)
+    else
+        buffer = makeSilentProbeBuffer()
+    end
 
     for _, row in ipairs(rows) do
         pending[row.name] = true
@@ -996,23 +1032,17 @@ local function speakerPassFailReport(title, audible)
 
     for _, item in ipairs(citySpeakers) do
         local name = tostring(item.name)
-        local ok, accepted
 
-        if audible then
-            ok, accepted = pcall(function()
-                item.speaker.stop()
-                item.speaker.playSound("minecraft:block.note_block.chime", 1, 1.2)
-                sleep(0.05)
-                return item.speaker.playAudio(probe, 1)
-            end)
-        else
-            ok, accepted = pcall(function()
-                return item.speaker.playAudio(probe, 1)
-            end)
-        end
+        local ok, accepted = pcall(function()
+            return item.speaker.playAudio(buffer, audible and SPEAKER_AUDIBLE_TEST_VOLUME or 1)
+        end)
 
         if ok and accepted then
-            updateReportRow(rows, name, "UNKNOWN", "accepted; waiting empty")
+            if audible then
+                updateReportRow(rows, name, "UNKNOWN", "tone accepted; waiting")
+            else
+                updateReportRow(rows, name, "UNKNOWN", "accepted; waiting empty")
+            end
         elseif ok and not accepted then
             updateReportRow(rows, name, "FAIL", "rejected/buffer full")
             if pending[name] then
@@ -1028,7 +1058,11 @@ local function speakerPassFailReport(title, audible)
         end
     end
 
-    printReportTable(title or "SPEAKER TEST REPORT", rows, "Commands sent. Waiting for speaker_audio_empty replies...")
+    if audible then
+        printReportTable(title or "SPEAKER REAL AUDIO REPORT", rows, "Tone sent. Waiting for speaker_audio_empty replies...")
+    else
+        printReportTable(title or "SPEAKER PING REPORT", rows, "Probe sent. Waiting for speaker_audio_empty replies...")
+    end
 
     local timer = os.startTimer(SPEAKER_TEST_TIMEOUT or 8)
 
@@ -1051,7 +1085,12 @@ local function speakerPassFailReport(title, audible)
             if pending[name] then
                 pending[name] = nil
                 pendingCount = pendingCount - 1
-                updateReportRow(rows, name, "PASS", "accepted + drained")
+
+                if audible then
+                    updateReportRow(rows, name, "PASS", "real tone accepted+drained")
+                else
+                    updateReportRow(rows, name, "PASS", "accepted + drained")
+                end
             end
 
         elseif event == "timer" and p1 == timer then
@@ -1077,7 +1116,18 @@ local function speakerPassFailReport(title, audible)
     local pass, fail, unknown, pend = reportCounts(rows)
     local clean = fail == 0 and unknown == 0 and pend == 0
 
-    printReportTable(title or "SPEAKER TEST FINAL REPORT", rows, clean and "RESULT: CLEAN PASS" or "RESULT: NOT CLEAN - see FAIL/UNKNOWN rows")
+    local finalNote
+    if audible then
+        finalNote = clean and
+            "RESULT: SOFTWARE CLEAN PASS. If a physical area is silent, CC accepted audio but Minecraft/client/chunk audibility is failing there." or
+            "RESULT: NOT CLEAN - see FAIL/UNKNOWN rows."
+    else
+        finalNote = clean and
+            "RESULT: CLEAN PASS" or
+            "RESULT: NOT CLEAN - see FAIL/UNKNOWN rows."
+    end
+
+    printReportTable(title or "SPEAKER TEST FINAL REPORT", rows, finalNote)
 
     return clean, rows
 end
@@ -1087,12 +1137,60 @@ local function speakerPingReportCommand()
 end
 
 local function speakerAudibleReportCommand()
-    print("Audible test: it will chime, but PASS/FAIL is based on CC buffer response.")
-    return speakerPassFailReport("SPEAKER AUDIBLE PASS/FAIL REPORT", true)
+    print("Audible test: sending real playAudio tone buffer to every speaker.")
+    return speakerPassFailReport("SPEAKER REAL AUDIO PASS/FAIL REPORT", true)
+end
+
+local beaconRunning = false
+
+local function speakerBeaconAll()
+    beaconRunning = true
+
+    print("")
+    print("SPEAKER BEACON STARTED")
+    print("Repeated real tone bursts will be sent to every visible speaker for " .. tostring(SPEAKER_BEACON_SECONDS) .. " seconds.")
+    print("If a location stays silent while this runs, the speaker is software-alive but not audibly outputting in-world.")
+    print("")
+
+    local stopAt = os.clock() + SPEAKER_BEACON_SECONDS
+
+    while beaconRunning and os.clock() < stopAt do
+        for _, item in ipairs(citySpeakers) do
+            pcall(function()
+                item.speaker.stop()
+            end)
+        end
+
+        sleep(0.1)
+        speakerPassFailReport("SPEAKER BEACON REAL AUDIO REPORT", true)
+        sleep(0.35)
+    end
+
+    beaconRunning = false
+
+    for _, item in ipairs(citySpeakers) do
+        pcall(function()
+            item.speaker.stop()
+        end)
+    end
+
+    print("SPEAKER BEACON FINISHED")
+end
+
+local function stopSpeakerBeacon()
+    beaconRunning = false
+
+    for _, item in ipairs(citySpeakers) do
+        pcall(function()
+            item.speaker.stop()
+        end)
+    end
+
+    print("Speaker beacon stopped.")
 end
 
 local function testSpeakers()
-    speakerRealAudioReport("SPEAKER REAL AUDIO PASS/FAIL REPORT", 0.45)
+    speakerAudibleReportCommand()
 end
 
 -- =============================================================================
@@ -2040,7 +2138,10 @@ local function bootScreen()
     print("  peripherals - list every visible peripheral")
     print("  monitors    - refresh/list monitor mirror")
     print("  montest     - test monitor mirror")
-    print("  testspk     - play test chime on all speakers")
+    print("  testspk     - real audio PASS/FAIL speaker report")
+    print("  spping      - silent PASS/FAIL speaker report")
+    print("  sphear      - real audio PASS/FAIL speaker report")
+    print("  spbeacon    - repeated real tone bursts to all speakers")
     print("  stopspk     - stop all speakers")
     print("  tts on      - enable TTS")
     print("  tts off     - disable TTS")
@@ -2132,6 +2233,12 @@ local function chatLoop()
 
             elseif lower == "sphear" or lower == "sptesthear" or lower == "speakeraudible" then
                 speakerAudibleReportCommand()
+
+            elseif lower == "spbeacon" or lower == "speakerbeacon" then
+                speakerBeaconAll()
+
+            elseif lower == "stopbeacon" or lower == "spstopbeacon" then
+                stopSpeakerBeacon()
 
             elseif lower == "stopspk" then
                 stopAllSpeakers()
