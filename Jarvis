@@ -31,7 +31,7 @@
 --   stopmusic
 -- =============================================================================
 
-local VERSION = "4.7.0-command-pa-controller-voice-sync"
+local VERSION = "4.8.0-command-pa-sync-start"
 local args = {...}
 
 -- =============================================================================
@@ -48,7 +48,12 @@ local SPEAKER_DROP_FILE = "jarvis_dropped_speakers.txt"
 local PA_NODE_PROTOCOL = "JARVIS_PA_V1"
 local PA_NODE_DISCOVERY_TIMEOUT = 1.5
 local PA_NODE_ACK_TIMEOUT = 2.0
-local PA_NODE_PRESTART_DELAY = 0.15
+local PA_NODE_PRESTART_DELAY = 0
+
+-- Nodes should act as extensions of JARVIS.
+-- They should use the same TTS provider/model/voice/instructions sent by JARVIS.
+-- If true, nodes must not silently use the wrong fallback voice.
+local PA_NODE_STRICT_TTS_MATCH = true
 
 -- Mirror literally all terminal print/write output to every visible monitor.
 local MONITOR_MIRROR_ENABLED = true
@@ -968,37 +973,38 @@ end
 
 local function nodeProgram(ttsText, track, language, ttsInstructions)
     local instructions = ttsInstructions or OPENAI_TTS_INSTRUCTIONS
+    local programmeLanguage = language or "normal"
 
-    if language == "mandarin_morning" then
+    if programmeLanguage == "mandarin_morning" then
         instructions = ttsInstructions or MORNING_TTS_INSTRUCTIONS
     end
 
-    if not track then
-        return sendNodeCommand({
-            type = "speak",
-            text = tostring(ttsText or ""),
-            volume = TTS_VOLUME,
-            language = language or "normal",
-            voice = OPENAI_TTS_VOICE,
-            tts_provider = TTS_PROVIDER,
-            tts_model = OPENAI_TTS_MODEL,
-            tts_instructions = instructions,
-        }, PA_NODE_ACK_TIMEOUT, true)
-    end
-
-    return sendNodeCommand({
-        type = "program",
-        tts_text = tostring(ttsText or ""),
-        language = language or "normal",
+    local base = {
+        language = programmeLanguage,
         voice = OPENAI_TTS_VOICE,
         tts_provider = TTS_PROVIDER,
         tts_model = OPENAI_TTS_MODEL,
         tts_instructions = instructions,
-        tts_volume = TTS_VOLUME,
-        music_url = tostring(track.url or ""),
-        music_name = tostring(track.name or "track"),
-        music_volume = MUSIC_VOLUME,
-    }, PA_NODE_ACK_TIMEOUT, true)
+        strict_tts_match = PA_NODE_STRICT_TTS_MATCH,
+        controller_version = VERSION,
+    }
+
+    if not track then
+        base.type = "speak"
+        base.text = tostring(ttsText or "")
+        base.volume = TTS_VOLUME
+
+        return sendNodeCommand(base, PA_NODE_ACK_TIMEOUT, true)
+    end
+
+    base.type = "program"
+    base.tts_text = tostring(ttsText or "")
+    base.tts_volume = TTS_VOLUME
+    base.music_url = tostring(track.url or "")
+    base.music_name = tostring(track.name or "track")
+    base.music_volume = MUSIC_VOLUME
+
+    return sendNodeCommand(base, PA_NODE_ACK_TIMEOUT, true)
 end
 
 
@@ -2200,7 +2206,7 @@ local function loadTracksFromGitHub()
                     file = item.name,
                     name = niceTrackName(item.name),
                     size = tonumber(item.size) or 0,
-                    url = makeTrackUrl(item.name),
+                    url = item.download_url or makeTrackUrl(item.name),
                 }
             end
         end
@@ -2542,9 +2548,11 @@ local function printMorningBroadcast(forced)
     print("Selecting daily patriotic music through JARVIS...")
     local morningTrack = pickRandomMusicTrack()
 
-    print("[NODE] Sending one programme command to wireless speaker nodes: TTS then music.")
-    nodeProgram(speech, morningTrack, "mandarin_morning", MORNING_TTS_INSTRUCTIONS)
-    sleep(PA_NODE_PRESTART_DELAY)
+    print("[NODE] Sending same programme command to wireless speaker nodes.")
+    print("[NODE] Sync rule: node ACK means it has received the programme and is starting now.")
+    local nodeOk, nodeTotal = nodeProgram(speech, morningTrack, "mandarin_morning", MORNING_TTS_INSTRUCTIONS)
+    print("[NODE] Programme start ACKs: " .. tostring(nodeOk) .. "/" .. tostring(nodeTotal))
+    print("[SYNC] Main JARVIS direct TTS starting now.")
 
     local okSpeak, speakErr = speakToCity(speech, false, MORNING_TTS_INSTRUCTIONS)
     if not okSpeak then
@@ -2760,7 +2768,7 @@ local function chatLoop()
                 print("Morning broadcast language: angry Mandarin only")
                 print("TTS provider: " .. tostring(TTS_PROVIDER))
                 print("OpenAI TTS voice: " .. tostring(OPENAI_TTS_VOICE))
-                print("Speaker audio mode: command-based PA nodes + direct wired speakers; voice synced by node TTS")
+                print("Speaker audio mode: synced programme command nodes + direct wired speakers")
 
             elseif lower == "update" or lower == "selfupdate" then
                 print("Forcing GitHub self-update from:")
