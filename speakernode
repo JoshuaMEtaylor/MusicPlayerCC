@@ -12,7 +12,7 @@
 --   - Put JarvisKey.lua on this computer if you want OpenAI TTS on the node.
 --   - If no key exists, it falls back to legacy music.madefor.cc TTS.
 
-local VERSION = "1.1.0-multi-speaker-node"
+local VERSION = "1.1.1-multi-speaker-node-hastype-fix"
 
 -- =============================================================================
 -- CONFIG
@@ -124,25 +124,46 @@ end
 -- =============================================================================
 
 local function peripheralHasType(name, wanted)
+    if not peripheral or not peripheral.getType then
+        return false
+    end
+
+    -- Compatibility: older CC builds/modpacks may not have peripheral.hasType.
     if peripheral.hasType then
         local ok, result = pcall(function()
             return peripheral.hasType(name, wanted)
         end)
 
-        if ok and result then return true end
+        if ok and result then
+            return true
+        end
     end
 
-    local pType = peripheral.getType(name)
+    local okType, pType = pcall(function()
+        return peripheral.getType(name)
+    end)
 
-    if pType == wanted then return true end
+    if not okType then
+        return false
+    end
+
+    if pType == wanted then
+        return true
+    end
 
     if type(pType) == "table" then
         for _, t in ipairs(pType) do
-            if t == wanted then return true end
+            if t == wanted then
+                return true
+            end
         end
     end
 
     return false
+end
+
+local function periphHasType(name, wanted)
+    return peripheralHasType(name, wanted)
 end
 
 local function openAllModems()
