@@ -31,7 +31,7 @@
 --   stopmusic
 -- =============================================================================
 
-local VERSION = "3.3.0-monitor-passfail-restored"
+local VERSION = "3.4.0-selfupdate-restored"
 local args = {...}
 
 -- =============================================================================
@@ -377,37 +377,47 @@ end
 -- SAFE SELF UPDATE
 -- =============================================================================
 
-local function selfUpdate()
-    if not UPDATE_ENABLED then return end
+-- =============================================================================
+-- SAFE SELF UPDATE
+-- =============================================================================
 
-    if hasArg(UPDATE_SKIP_ARG) then
+local function selfUpdate(force)
+    if not UPDATE_ENABLED then
+        return nil
+    end
+
+    if hasArg(UPDATE_SKIP_ARG) and not force then
         print("Auto-update skipped for freshly relaunched copy.")
-        return
+        return nil
     end
 
     if not http or not http.get then
         print("HTTP unavailable. Skipping update.")
-        return
+        return nil
     end
 
     if not shell or not shell.run then
         print("Shell API unavailable. Skipping update.")
-        return
+        return nil
     end
 
     if not UPDATE_URL or UPDATE_URL == "" then
         print("No UPDATE_URL set. Skipping update.")
-        return
+        return nil
     end
 
     local program = shell.getRunningProgram and shell.getRunningProgram() or "Jarvis"
-    if not program or program == "" then program = "Jarvis" end
 
-    print("[ JARVIS Town Broadcast Core ]")
-    print("Checking GitHub update...")
+    if not program or program == "" then
+        program = "Jarvis"
+    end
+
+    print("[ JARVIS ] Checking GitHub update...")
+    print("Update URL: " .. tostring(UPDATE_URL))
 
     local tmp = program .. ".new"
     local old = program .. ".old"
+
     fs.delete(tmp)
 
     local cb = tostring(os.epoch and os.epoch("utc") or math.floor(os.clock() * 100000))
@@ -415,14 +425,14 @@ local function selfUpdate()
     local url = UPDATE_URL .. sep .. "cb=" .. cb
 
     local handle = http.get(url, {
-        ["User-Agent"] = "CC-Tweaked-JARVIS-Town-Broadcast-Updater",
+        ["User-Agent"] = "CC-Tweaked-JARVIS-Updater",
         ["Cache-Control"] = "no-cache",
     })
 
     if not handle then
-        print("Update failed: no HTTP response. Keeping local copy.")
-        sleep(0.5)
-        return
+        print("Update failed: no HTTP response.")
+        print("Keeping local copy.")
+        return nil
     end
 
     local body = handle.readAll()
@@ -433,32 +443,40 @@ local function selfUpdate()
         #body > 1000 and
         not body:find("404: Not Found", 1, true) and
         not body:find("<!DOCTYPE html", 1, true) and
-        not body:find("<html", 1, true)
+        not body:find("<html", 1, true) and
+        not body:find("Rate limit exceeded", 1, true)
 
     if not okDownload then
         fs.delete(tmp)
-        print("Update rejected: empty, invalid, or not raw Lua. Keeping local copy.")
-        sleep(0.5)
-        return
+        print("Update rejected: empty, invalid, or not raw Lua.")
+        print("Keeping local copy.")
+        return nil
     end
 
     local f = fs.open(tmp, "w")
+
     if not f then
-        print("Could not write temporary update file. Keeping local copy.")
-        return
+        print("Could not write temporary update file.")
+        print("Keeping local copy.")
+        return nil
     end
 
     f.write(body)
     f.close()
 
     fs.delete(old)
-    if fs.exists(program) then fs.move(program, old) end
+
+    if fs.exists(program) then
+        fs.move(program, old)
+    end
+
     fs.move(tmp, program)
 
-    print("Updated. Relaunching...")
+    print("Updated successfully. Relaunching...")
     sleep(0.5)
 
     local relaunch = { program, UPDATE_SKIP_ARG }
+
     for i = 1, #args do
         if tostring(args[i]) ~= UPDATE_SKIP_ARG then
             relaunch[#relaunch + 1] = tostring(args[i])
@@ -467,11 +485,15 @@ local function selfUpdate()
 
     local unpackFn = table.unpack or unpack
     shell.run(unpackFn(relaunch))
+
     return "updated"
 end
 
-local updateResult = selfUpdate()
-if updateResult == "updated" then return end
+local updateResult = selfUpdate(false)
+
+if updateResult == "updated" then
+    return
+end
 
 -- =============================================================================
 -- API KEY LOADING
@@ -2012,6 +2034,7 @@ local function bootScreen()
     print("  tts test    - speak test line")
     print("  tts debug   - full TTS diagnostic")
     print("  tts mandarin- angry Mandarin TTS test")
+    print("  update     - force GitHub self-update")
     print("  version     - show active version")
     print("  voice cedar - change OpenAI voice")
     print("  voices      - list recommended voices")
@@ -2076,6 +2099,17 @@ local function chatLoop()
                 print("Morning broadcast language: angry Mandarin only")
                 print("TTS provider: " .. tostring(TTS_PROVIDER))
                 print("OpenAI TTS voice: " .. tostring(OPENAI_TTS_VOICE))
+
+            elseif lower == "update" or lower == "selfupdate" then
+                print("Forcing GitHub self-update from:")
+                print(UPDATE_URL)
+                local result = selfUpdate(true)
+
+                if result == "updated" then
+                    return
+                else
+                    print("No update applied or update failed. Local copy kept.")
+                end
 
             elseif lower == "testspk" then
                 testSpeakers()
