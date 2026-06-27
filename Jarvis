@@ -31,7 +31,7 @@
 --   stopmusic
 -- =============================================================================
 
-local VERSION = "4.0.0-manual-target-smooth-audio"
+local VERSION = "4.1.0-all-detected-lockstep"
 local args = {...}
 
 -- =============================================================================
@@ -40,7 +40,6 @@ local args = {...}
 
 local KEY_FILE = "JarvisKey.lua"
 local RAW_RESPONSE_FILE = "jarvis_latest_raw_response.txt"
-local SPEAKER_DROP_FILE = "jarvis_dropped_speakers.txt"
 
 -- Mirror literally all terminal print/write output to every visible monitor.
 local MONITOR_MIRROR_ENABLED = true
@@ -59,6 +58,9 @@ local TTS_TOTAL_MAX_CHARS = 2600
 local AUDIO_WAIT_TIMEOUT = 0.35
 local SPEAKER_ORDERED_SEND_TIMEOUT = 8
 local SPEAKER_ORDERED_MAX_RETRIES = 80
+local SPEAKER_HARD_RESET_PASSES = 4
+local SPEAKER_HARD_RESET_GAP = 0.12
+local SPEAKER_WAIT_TIMEOUT = 6.0
 local SPEAKER_TEST_TIMEOUT = 8
 local SPEAKER_AUDIBLE_TEST_HZ = 660
 local SPEAKER_AUDIBLE_TEST_VOLUME = 1.0
@@ -109,7 +111,7 @@ local MUSIC_REPO_BRANCH = "main"
 local MUSIC_API_URL = "https://api.github.com/repos/" .. MUSIC_REPO_USER .. "/" .. MUSIC_REPO_NAME .. "/contents?ref=" .. MUSIC_REPO_BRANCH
 local MUSIC_RAW_BASE = "https://raw.githubusercontent.com/" .. MUSIC_REPO_USER .. "/" .. MUSIC_REPO_NAME .. "/" .. MUSIC_REPO_BRANCH .. "/"
 local MUSIC_VOLUME = 1.0
-local MUSIC_CHUNK_SIZE = 16 * 1024
+local MUSIC_CHUNK_SIZE = 64 * 1024 * 1024
 
 local NATION_NAME = "the Ako Dynasty"
 local LEADER_NAME = "Ako"
@@ -646,7 +648,6 @@ end
 -- =============================================================================
 
 local citySpeakers = {}
-local droppedSpeakers = {}
 
 local function peripheralIsSpeaker(name)
     if not name then return false end
@@ -729,165 +730,18 @@ local function printAllPeripherals()
     print("")
 end
 
-local function loadDroppedSpeakers()
-    droppedSpeakers = {}
-
-    local raw = readAll(SPEAKER_DROP_FILE)
-    if not raw then return end
-
-    for lineText in raw:gmatch("[^\r\n]+") do
-        local name = trim(lineText)
-        if name ~= "" then
-            droppedSpeakers[name] = true
-        end
-    end
-end
-
-local function saveDroppedSpeakers()
-    local names = {}
-
-    for name, dropped in pairs(droppedSpeakers) do
-        if dropped then
-            names[#names + 1] = name
-        end
-    end
-
-    table.sort(names)
-    writeFile(SPEAKER_DROP_FILE, table.concat(names, "\n"))
-end
-
-local function isSpeakerDropped(name)
-    return droppedSpeakers[tostring(name or "")] == true
-end
-
-local function activeBroadcastSpeakers()
-    scanSpeakers()
-
-    local list = {}
-
-    for _, item in ipairs(citySpeakers) do
-        if not isSpeakerDropped(item.name) then
-            list[#list + 1] = item
-        end
-    end
-
-    return list
-end
-
-local function resolveSpeakerRef(ref)
-    scanSpeakers()
-
-    ref = trim(ref or "")
-
-    if ref == "" then
-        return nil, "No speaker reference supplied."
-    end
-
-    local n = tonumber(ref)
-    if n and citySpeakers[n] then
-        return citySpeakers[n], nil
-    end
-
-    for _, item in ipairs(citySpeakers) do
-        if tostring(item.name) == ref then
-            return item, nil
-        end
-    end
-
-    return nil, "No visible speaker matches '" .. tostring(ref) .. "'."
-end
-
-local function dropSpeaker(ref)
-    local item, err = resolveSpeakerRef(ref)
-
-    if not item then
-        print(err)
-        return false
-    end
-
-    local name = tostring(item.name)
-    droppedSpeakers[name] = true
-    saveDroppedSpeakers()
-
-    pcall(function()
-        item.speaker.stop()
-    end)
-
-    print("Dropped speaker from broadcasts: " .. name)
-    print("It will stay excluded until you run: spuse " .. name)
-    return true
-end
-
-local function useSpeaker(ref)
-    local item, err = resolveSpeakerRef(ref)
-
-    if not item then
-        print(err)
-        return false
-    end
-
-    local name = tostring(item.name)
-    droppedSpeakers[name] = nil
-    saveDroppedSpeakers()
-
-    print("Restored speaker to broadcasts: " .. name)
-    return true
-end
-
-local function clearDroppedSpeakers()
-    droppedSpeakers = {}
-    saveDroppedSpeakers()
-    print("Dropped speaker list cleared. All visible speakers are broadcast targets again.")
-end
-
-local function printBroadcastTargets()
-    scanSpeakers()
-
-    print("")
-    line()
-    print("BROADCAST SPEAKER TARGETS")
-    print("Mode: smooth ordered playback to active speakers only.")
-    print("Dropped speakers receive no TTS or music.")
-    print("")
-
-    local active = 0
-    local dropped = 0
-
-    for i, item in ipairs(citySpeakers) do
-        local name = tostring(item.name)
-
-        if isSpeakerDropped(name) then
-            dropped = dropped + 1
-            print(tostring(i) .. ". " .. name .. "  DROPPED")
-        else
-            active = active + 1
-            print(tostring(i) .. ". " .. name .. "  active")
-        end
-    end
-
-    print("")
-    print("Active: " .. tostring(active) .. " | Dropped: " .. tostring(dropped) .. " | Visible: " .. tostring(#citySpeakers))
-    print("")
-    print("Drop dead speaker: spdrop <number/name>")
-    print("Restore speaker:   spuse <number/name>")
-    print("Clear drops:       spresume")
-    line()
-    print("")
-end
-
 local function printSpeakerOrder()
     scanSpeakers()
 
     print("")
     line()
     print("ORDERED BROADCAST SPEAKER ORDER")
-    print("Active speakers receive the full continuous stream in this order.")
-    print("Dropped speakers are skipped entirely, not fed partial audio.")
+    print("Every detected speaker receives every audio buffer in this order.")
+    print("No drops, no chunk skipping.")
     print("")
 
     for i, item in ipairs(citySpeakers) do
-        local status = isSpeakerDropped(item.name) and "DROPPED" or "active"
-        print(tostring(i) .. ". " .. tostring(item.name) .. "  " .. status)
+        print(tostring(i) .. ". " .. tostring(item.name))
     end
 
     line()
@@ -898,7 +752,7 @@ local function printSpeakers()
     print("")
     line()
     print("WIRED CITY SPEAKER NETWORK")
-    print("Audio mode: ordered per-speaker broadcast")
+    print("Audio mode: all-detected lockstep broadcast")
     print("Detected speaker peripherals: " .. tostring(#citySpeakers))
     print("TTS: " .. (TTS_ENABLED and "enabled" or "disabled"))
     print("Music: " .. (MUSIC_VOLUME > 0 and "enabled" or "muted"))
@@ -931,8 +785,26 @@ local function rescanSpeakers()
     printSpeakers()
 end
 
+local function hardResetAllDetectedSpeakers(reason)
+    scanSpeakers()
+
+    print("[AUDIO] Hard reset all detected speakers" .. (reason and (": " .. tostring(reason)) or ""))
+
+    for pass = 1, SPEAKER_HARD_RESET_PASSES do
+        for _, item in ipairs(citySpeakers) do
+            pcall(function()
+                item.speaker.stop()
+            end)
+        end
+
+        sleep(SPEAKER_HARD_RESET_GAP)
+    end
+
+    print("[AUDIO] Reset complete: " .. tostring(#citySpeakers) .. " speaker(s).")
+end
+
 local function waitForSpeakerEmpty(speakerName, timeoutSeconds, shouldContinue)
-    local timer = os.startTimer(timeoutSeconds or SPEAKER_ORDERED_SEND_TIMEOUT)
+    local timer = os.startTimer(timeoutSeconds or SPEAKER_WAIT_TIMEOUT)
 
     while true do
         if shouldContinue and not shouldContinue() then
@@ -959,7 +831,7 @@ local function playAudioBufferOnSpeaker(item, buffer, volume, debug, shouldConti
     local name = tostring(item.name)
     local retries = 0
 
-    while true do
+    while retries < SPEAKER_ORDERED_MAX_RETRIES do
         if shouldContinue and not shouldContinue() then
             return false, "cancelled"
         end
@@ -974,6 +846,7 @@ local function playAudioBufferOnSpeaker(item, buffer, volume, debug, shouldConti
             if debug then
                 print("[AUDIO] " .. name .. " accepted")
             end
+
             return true
         end
 
@@ -981,39 +854,49 @@ local function playAudioBufferOnSpeaker(item, buffer, volume, debug, shouldConti
             return false, "playAudio error on " .. name .. ": " .. tostring(accepted)
         end
 
-        if retries >= SPEAKER_ORDERED_MAX_RETRIES then
-            return false, "too many retries sending to " .. name
-        end
-
-        -- Buffer-full is normal during continuous audio. Wait for THIS speaker
-        -- to request the next buffer. This preserves smooth audio for active speakers.
         if debug then
-            print("[AUDIO] " .. name .. " buffer full; waiting for empty")
+            print("[AUDIO] " .. name .. " full; waiting for that speaker")
         end
 
-        local waited, waitErr = waitForSpeakerEmpty(name, SPEAKER_ORDERED_SEND_TIMEOUT, shouldContinue)
+        local waited, waitErr = waitForSpeakerEmpty(name, SPEAKER_WAIT_TIMEOUT, shouldContinue)
+
         if not waited then
-            return false, waitErr
+            if debug then
+                print("[AUDIO] " .. name .. " wait failed; stopping only this speaker and retrying: " .. tostring(waitErr))
+            end
+
+            pcall(function()
+                item.speaker.stop()
+            end)
+
+            sleep(0.15)
         end
     end
+
+    return false, "too many retries sending to " .. name
 end
 
 local function playAudioBufferOnAll(buffer, volume, debug, shouldContinue)
-    -- Smooth active-only ordered broadcast:
-    -- dead speakers should be manually removed with spdrop.
-    -- active speakers receive every buffer continuously.
-    local targets = activeBroadcastSpeakers()
+    -- ALL-DETECTED LOCKSTEP:
+    -- Every visible speaker gets every audio buffer.
+    -- No manual drops. No chunk skipping.
+    scanSpeakers()
 
-    if #targets == 0 then
-        return false, "No active broadcast speakers. Run spresume or spuse <speaker>."
+    if #citySpeakers == 0 then
+        return false, "No visible speaker peripherals."
     end
 
     if debug then
-        print("[AUDIO] Smooth ordered broadcast to " .. tostring(#targets) .. "/" .. tostring(#citySpeakers) .. " speaker(s).")
+        print("[AUDIO] All-detected lockstep broadcast to " .. tostring(#citySpeakers) .. " speaker(s).")
     end
 
-    for _, item in ipairs(targets) do
+    for _, item in ipairs(citySpeakers) do
+        if shouldContinue and not shouldContinue() then
+            return false, "cancelled"
+        end
+
         local ok, err = playAudioBufferOnSpeaker(item, buffer, volume, debug, shouldContinue)
+
         if not ok then
             return false, err
         end
@@ -1023,16 +906,16 @@ local function playAudioBufferOnAll(buffer, volume, debug, shouldContinue)
 end
 
 local function playOnAllSpeakers(sound, volume, pitch)
-    local targets = activeBroadcastSpeakers()
+    scanSpeakers()
 
-    if #targets == 0 then
-        print("No active broadcast speakers.")
+    if #citySpeakers == 0 then
+        print("No visible speaker peripherals.")
         return false, 0
     end
 
     local okCount = 0
 
-    for _, item in ipairs(targets) do
+    for _, item in ipairs(citySpeakers) do
         local ok, err = pcall(function()
             item.speaker.playSound(sound, volume or 1, pitch or 1)
         end)
@@ -1979,7 +1862,7 @@ local function playMusicTrack(track)
     end
 
     print("[MUSIC] Opening stream: " .. tostring(track.name))
-    print("[MUSIC] Broadcasting to " .. tostring(#activeBroadcastSpeakers()) .. "/" .. tostring(#citySpeakers) .. " active speaker(s).")
+    print("[MUSIC] Broadcasting to " .. tostring(#citySpeakers) .. " visible speaker(s).")
 
     local handle = http.get(track.url, {
         ["User-Agent"] = "CC-Tweaked-JARVIS-Music",
@@ -2223,6 +2106,7 @@ local function printMorningBroadcast(forced)
     print("")
 
     stopMusic("morning broadcast")
+    hardResetAllDetectedSpeakers("before morning TTS")
     playOnAllSpeakers("minecraft:block.note_block.chime", 1, 1.0)
     sleep(0.15)
     playOnAllSpeakers("minecraft:block.note_block.chime", 1, 1.25)
@@ -2239,12 +2123,13 @@ local function printMorningBroadcast(forced)
         print("")
     end
 
-    local okSpeak, speakErr = speakToCity(speech, false, MORNING_TTS_INSTRUCTIONS)
+    local okSpeak, speakErr = speakToCity(speech, true, MORNING_TTS_INSTRUCTIONS)
     if not okSpeak then
         print("TTS warning: " .. tostring(speakErr))
     end
 
     print("")
+    hardResetAllDetectedSpeakers("between TTS and music")
     print("Selecting daily patriotic music through JARVIS...")
     playRandomMusic()
 
@@ -2330,10 +2215,7 @@ local function bootScreen()
     print("  morning     - force fresh GPT city broadcast")
     print("  speakers    - rescan/list visible speakers")
     print("  speakerorder - show ordered broadcast order")
-    print("  sptargets - show active/dropped speakers")
-    print("  spdrop 3  - remove dead speaker from broadcasts")
-    print("  spuse 3   - restore a dropped speaker")
-    print("  spresume  - clear all dropped speakers")
+    print("  sphardreset - stop/reset every detected speaker")
     print("  peripherals - list every visible peripheral")
     print("  monitors    - refresh/list monitor mirror")
     print("  montest     - test monitor mirror")
@@ -2399,23 +2281,8 @@ local function chatLoop()
             elseif lower == "speakerorder" or lower == "sporder" then
                 printSpeakerOrder()
 
-            elseif lower == "sptargets" or lower == "spquarantine" or lower == "spbad" then
-                printBroadcastTargets()
-
-            elseif lower == "spresume" or lower == "spclear" then
-                clearDroppedSpeakers()
-
-            elseif lower:match("^spdrop%s+") or lower:match("^speaker%s+drop%s+") then
-                local ref =
-                    input:match("^spdrop%s+(.+)$") or
-                    input:match("^speaker%s+drop%s+(.+)$")
-                dropSpeaker(ref)
-
-            elseif lower:match("^spuse%s+") or lower:match("^speaker%s+use%s+") then
-                local ref =
-                    input:match("^spuse%s+(.+)$") or
-                    input:match("^speaker%s+use%s+(.+)$")
-                useSpeaker(ref)
+            elseif lower == "sphardreset" or lower == "speakerreset" or lower == "audioreset" then
+                hardResetAllDetectedSpeakers("manual command")
 
             elseif lower == "peripherals" then
                 printAllPeripherals()
@@ -2433,7 +2300,7 @@ local function chatLoop()
                 print("Morning broadcast language: angry Mandarin only")
                 print("TTS provider: " .. tostring(TTS_PROVIDER))
                 print("OpenAI TTS voice: " .. tostring(OPENAI_TTS_VOICE))
-                print("Speaker audio mode: smooth active-only ordered broadcast")
+                print("Speaker audio mode: all-detected lockstep broadcast")
 
             elseif lower == "update" or lower == "selfupdate" then
                 print("Forcing GitHub self-update from:")
@@ -2545,7 +2412,6 @@ end
 
 math.randomseed(os.epoch and os.epoch("utc") or math.floor(os.clock() * 100000))
 
-loadDroppedSpeakers()
 startMonitorMirror()
 
 print("Scanning wired speaker network...")
