@@ -1,31 +1,25 @@
--- JARVIS Dumb Speaker Terminal Node
--- Version: 2.0.0-dumb-audio-relay
+-- JARVIS Command Speaker Node
+-- Version: 3.0.0-command-program-node
 --
--- Purpose:
---   This node does NOT fetch HTTP.
---   This node does NOT use an OpenAI API key.
---   This node does NOT generate TTS.
+-- Sensible node model:
+--   JARVIS sends one command:
+--      play this TTS text, then play this music URL.
 --
--- JARVIS main computer generates/decodes all audio and sends raw speaker buffers
--- over rednet. This node simply receives those buffers and plays them through
--- every speaker it can see locally.
---
--- Setup:
---   1. Put this on a computer near the broken/new speaker branch.
---   2. Attach wireless/ender modem to this computer.
---   3. Attach one speaker directly OR attach a small local wired speaker branch.
---   4. Run this script as startup.
+-- The node does not use OpenAI, JarvisKey, or audio packet streams.
+-- It only uses HTTP to fetch the public TTS/music audio it was told to play.
 
-local VERSION = "2.1.1-dumb-node-synced-checked"
+local VERSION = "3.0.0-command-program-node"
 local PROTOCOL = "JARVIS_PA_V1"
 
 local NODE_LABEL = os.getComputerLabel() or ("SpeakerNode-" .. tostring(os.getComputerID()))
 
+local TTS_VOLUME = 1.0
+local MUSIC_VOLUME = 1.0
+local AUDIO_CHUNK_SIZE = 16 * 1024
+
 local localSpeakers = {}
-local audioQueue = {}
-local currentStreamId = nil
-local streamPlaying = false
-local queueLimit = 256
+local currentJob = nil
+local cancelToken = 0
 
 -- =============================================================================
 -- HELPERS
@@ -33,6 +27,14 @@ local queueLimit = 256
 
 local function trim(s)
     return tostring(s or ""):match("^%s*(.-)%s*$")
+end
+
+local function urlEncode(str)
+    str = tostring(str or "")
+
+    return str:gsub("([^%w%-_%.~])", function(c)
+        return string.format("%%%02X", string.byte(c))
+    end)
 end
 
 local function boolText(v)
@@ -44,7 +46,6 @@ local function peripheralHasType(name, wanted)
         return false
     end
 
-    -- Compatibility with older CC builds that do not have peripheral.hasType.
     if peripheral.hasType then
         local ok, result = pcall(function()
             return peripheral.hasType(name, wanted)
@@ -79,12 +80,12 @@ local function peripheralHasType(name, wanted)
 end
 
 local function openAllModems()
-    local opened = 0
-
     if not rednet or not rednet.open then
         print("[NODE] Rednet unavailable.")
         return 0
     end
+
+    local opened = 0
 
     for _, name in ipairs(peripheral.getNames()) do
         if peripheralHasType(name, "modem") and not rednet.isOpen(name) then
@@ -147,8 +148,6 @@ end
 
 local function stopAudio()
     scanSpeakers()
-
-    audioQueue = {}
 
     for _, item in ipairs(localSpeakers) do
         pcall(function()
@@ -229,6 +228,8 @@ local function playChime(volume)
 end
 
 local function ack(to, commandId, ok, status, extra)
+    if not to then return end
+
     local msg = {
         type = "ack",
         command_id = commandId,
@@ -249,55 +250,87 @@ local function ack(to, commandId, ok, status, extra)
     rednet.send(to, msg, PROTOCOL)
 end
 
-local function clearStream(streamId)
-    currentStreamId = streamId
-    streamPlaying = false
-    audioQueue = {}
+-- =============================================================================
+-- AUDIO PLAYERS
+-- =============================================================================
 
-    for _, item in ipairs(localSpeakers) do
-        pcall(function()
-            item.speaker.stop()
-        end)
-    end
+local function shouldContinue(token)
+    return token == cancelToken
 end
 
-local function enqueueAudio(msg)
-    local streamId = tostring(msg.stream_id or "default")
+local function streamDfpwmUrl(url, volume, token, label)
+    url = trim(url or "")
 
-    if currentStreamId ~= streamId then
-        clearStream(streamId)
-        print("[NODE] New audio stream: " .. streamId .. " (waiting for play)")
+    if url == "" then
+        return true, "no url"
     end
 
-    if #audioQueue >= queueLimit then
-        table.remove(audioQueue, 1)
-        print("[NODE] Queue full; dropped oldest packet.")
+    if not http or not http.get then
+        return false, "HTTP unavailable on node."
     end
 
-    audioQueue[#audioQueue + 1] = {
-        buffer = msg.buffer,
-        volume = msg.volume or 1,
-    }
+    local dfpwm = require("cc.audio.dfpwm")
+    local decoder = dfpwm.make_decoder()
 
-    if streamPlaying then
-        os.queueEvent("jarvis_node_audio")
+    print("[NODE] Opening " .. tostring(label or "audio") .. "...")
+    local response = http.get(url, nil, true)
+
+    if not response then
+        return false, "HTTP request failed for " .. tostring(label or url)
     end
+
+    local chunks = 0
+
+    while shouldContinue(token) do
+        local chunk = response.read(AUDIO_CHUNK_SIZE)
+        if not chunk then break end
+
+        chunks = chunks + 1
+        local audio = decoder(chunk)
+        local ok, err = playBufferOnAll(audio, volume or 1)
+
+        if not ok then
+            response.close()
+            return false, err
+        end
+    end
+
+    response.close()
+
+    if not shouldContinue(token) then
+        return false, "cancelled"
+    end
+
+    print("[NODE] Finished " .. tostring(label or "audio") .. ". Chunks=" .. tostring(chunks))
+    return true, "played"
 end
 
-local function beginStream(streamId)
-    streamId = tostring(streamId or currentStreamId or "default")
+local function playTtsText(text, volume, token)
+    text = trim(text or "")
 
-    if currentStreamId ~= streamId then
-        currentStreamId = streamId
+    if text == "" then
+        return true, "no TTS text"
     end
 
-    streamPlaying = true
-    print("[NODE] Stream play: " .. tostring(currentStreamId) .. " | queued=" .. tostring(#audioQueue))
-    os.queueEvent("jarvis_node_audio")
+    local url = "https://music.madefor.cc/tts?text=" .. urlEncode(text)
+    return streamDfpwmUrl(url, volume or TTS_VOLUME, token, "TTS")
+end
+
+local function playMusicUrl(url, name, volume, token)
+    return streamDfpwmUrl(url, volume or MUSIC_VOLUME, token, "music: " .. tostring(name or "track"))
+end
+
+local function setJob(job)
+    cancelToken = cancelToken + 1
+    stopAudio()
+
+    job.token = cancelToken
+    currentJob = job
+    os.queueEvent("jarvis_node_job")
 end
 
 -- =============================================================================
--- LOOPS
+-- NETWORK LOOP
 -- =============================================================================
 
 local function listenerLoop()
@@ -309,26 +342,53 @@ local function listenerLoop()
                 ack(sender, msg.command_id, true, "hello", { response_type = "hello" })
 
             elseif msg.type == "stop" then
-                clearStream("stopped-" .. tostring(os.clock()))
+                cancelToken = cancelToken + 1
+                currentJob = nil
                 stopAudio()
                 ack(sender, msg.command_id, true, "stopped")
 
             elseif msg.type == "test_chime" then
+                cancelToken = cancelToken + 1
                 stopAudio()
                 local ok, err = playChime(msg.volume or 1)
                 ack(sender, msg.command_id, ok, ok and "chime sent" or tostring(err))
 
-            elseif msg.type == "stream_start" then
-                clearStream(tostring(msg.stream_id or "stream"))
-                ack(sender, msg.command_id, true, "stream prebuffering")
+            elseif msg.type == "program" then
+                setJob({
+                    type = "program",
+                    sender = sender,
+                    command_id = msg.command_id,
+                    tts_text = tostring(msg.tts_text or msg.text or ""),
+                    music_url = tostring(msg.music_url or msg.url or ""),
+                    music_name = tostring(msg.music_name or msg.name or "track"),
+                    tts_volume = msg.tts_volume or TTS_VOLUME,
+                    music_volume = msg.music_volume or MUSIC_VOLUME,
+                })
 
-            elseif msg.type == "stream_play" then
-                beginStream(tostring(msg.stream_id or currentStreamId or "stream"))
-                ack(sender, msg.command_id, true, "stream playing")
+                ack(sender, msg.command_id, true, "program queued")
 
-            elseif msg.type == "audio" then
-                -- No ack per audio packet. That would spam rednet and slow the stream.
-                enqueueAudio(msg)
+            elseif msg.type == "speak" then
+                setJob({
+                    type = "speak",
+                    sender = sender,
+                    command_id = msg.command_id,
+                    text = tostring(msg.text or ""),
+                    volume = msg.volume or TTS_VOLUME,
+                })
+
+                ack(sender, msg.command_id, true, "speak queued")
+
+            elseif msg.type == "music" then
+                setJob({
+                    type = "music",
+                    sender = sender,
+                    command_id = msg.command_id,
+                    url = tostring(msg.url or ""),
+                    name = tostring(msg.name or "track"),
+                    volume = msg.volume or MUSIC_VOLUME,
+                })
+
+                ack(sender, msg.command_id, true, "music queued")
 
             elseif msg.type == "set_label" then
                 NODE_LABEL = tostring(msg.label or NODE_LABEL)
@@ -339,17 +399,35 @@ local function listenerLoop()
     end
 end
 
-local function audioWorkerLoop()
+local function workerLoop()
     while true do
-        if #audioQueue == 0 then
-            os.pullEvent("jarvis_node_audio")
-        else
-            local packet = table.remove(audioQueue, 1)
-            local ok, err = playBufferOnAll(packet.buffer, packet.volume)
+        os.pullEvent("jarvis_node_job")
 
-            if not ok then
-                print("[NODE] Audio error: " .. tostring(err))
+        local job = currentJob
+        currentJob = nil
+
+        if job then
+            local ok, result = true, "done"
+
+            if job.type == "program" then
+                print("[NODE] Program from " .. tostring(job.sender) .. ": TTS then music.")
+                ok, result = playTtsText(job.tts_text, job.tts_volume, job.token)
+
+                if ok and shouldContinue(job.token) then
+                    ok, result = playMusicUrl(job.music_url, job.music_name, job.music_volume, job.token)
+                end
+
+            elseif job.type == "speak" then
+                print("[NODE] Speak from " .. tostring(job.sender))
+                ok, result = playTtsText(job.text, job.volume, job.token)
+
+            elseif job.type == "music" then
+                print("[NODE] Music from " .. tostring(job.sender) .. ": " .. tostring(job.name))
+                ok, result = playMusicUrl(job.url, job.name, job.volume, job.token)
             end
+
+            ack(job.sender, job.command_id, ok, result)
+            print("[NODE] Job finished: " .. tostring(result))
         end
     end
 end
@@ -367,18 +445,18 @@ local function commandLoop()
             print("ID: " .. tostring(os.getComputerID()))
             print("Version: " .. VERSION)
             print("Protocol: " .. PROTOCOL)
+            print("HTTP for public audio URLs: " .. boolText(http and http.get))
+            print("API key/OpenAI: not used")
             print("Speakers: " .. tostring(#localSpeakers))
             for i, item in ipairs(localSpeakers) do
                 print("  " .. tostring(i) .. ". " .. tostring(item.name))
             end
-            print("Queue: " .. tostring(#audioQueue))
-            print("Current stream: " .. tostring(currentStreamId))
-            print("Playing: " .. boolText(streamPlaying))
 
         elseif lower == "chime" or lower == "test" then
             playChime(1)
 
         elseif lower == "stop" then
+            cancelToken = cancelToken + 1
             stopAudio()
             print("Stopped.")
 
@@ -387,6 +465,7 @@ local function commandLoop()
             term.setCursorPos(1, 1)
 
         elseif lower == "exit" then
+            cancelToken = cancelToken + 1
             stopAudio()
             error("Terminated", 0)
 
@@ -404,18 +483,19 @@ openAllModems()
 scanSpeakers()
 
 print("")
-print("JARVIS DUMB SPEAKER NODE")
+print("JARVIS COMMAND SPEAKER NODE")
 print("Version: " .. VERSION)
 print("Computer ID: " .. tostring(os.getComputerID()))
 print("Label: " .. tostring(NODE_LABEL))
 print("Protocol: " .. PROTOCOL)
-print("HTTP/API: not used on this node")
+print("Role: receive command, play TTS, then play music")
+print("HTTP: used only for public TTS/music URLs")
+print("API key/OpenAI/JarvisKey: not used")
 print("Local speakers: " .. tostring(#localSpeakers))
 for i, item in ipairs(localSpeakers) do
     print("  " .. tostring(i) .. ". " .. tostring(item.name))
 end
-print("Waiting for raw audio packets from JARVIS...")
-print("Sync mode: prebuffer first audio, wait for stream_play, then start.")
+print("Waiting for JARVIS commands...")
 print("")
 
-parallel.waitForAny(listenerLoop, audioWorkerLoop, commandLoop)
+parallel.waitForAny(listenerLoop, workerLoop, commandLoop)
