@@ -31,7 +31,7 @@
 --   stopmusic
 -- =============================================================================
 
-local VERSION = "2.2.0-all-speaker-fanout"
+local VERSION = "2.3.0-drain-sync-fanout"
 local args = {...}
 
 -- =============================================================================
@@ -102,7 +102,11 @@ local MUSIC_REPO_BRANCH = "main"
 local MUSIC_API_URL = "https://api.github.com/repos/" .. MUSIC_REPO_USER .. "/" .. MUSIC_REPO_NAME .. "/contents?ref=" .. MUSIC_REPO_BRANCH
 local MUSIC_RAW_BASE = "https://raw.githubusercontent.com/" .. MUSIC_REPO_USER .. "/" .. MUSIC_REPO_NAME .. "/" .. MUSIC_REPO_BRANCH .. "/"
 local MUSIC_VOLUME = 1.0
-local MUSIC_CHUNK_SIZE = 8 * 1024
+local MUSIC_CHUNK_SIZE = 16 * 1024
+local AUDIO_DRAIN_TIMEOUT = 14.0
+local HARD_STOP_PASSES = 5
+local HARD_STOP_GAP = 0.18
+local PRE_MUSIC_SETTLE_SECONDS = 1.0
 
 -- Important:
 -- When true, JARVIS ignores the disabled-speaker list and attempts to feed every
@@ -967,6 +971,116 @@ local function playAudioBufferOnAll(buffer, volume, debug, shouldContinue)
     return true
 end
 
+
+local function waitForTargetSpeakersEmpty(label, timeoutSeconds, debug, shouldContinue)
+    scanSpeakers()
+
+    local speakersToUse = activeSpeakers()
+
+    if #speakersToUse == 0 then
+        return false, "No targeted speakers."
+    end
+
+    local pending = {}
+    local pendingCount = 0
+
+    for _, item in ipairs(speakersToUse) do
+        local name = tostring(item.name)
+        pending[name] = true
+        pendingCount = pendingCount + 1
+    end
+
+    local timer = os.startTimer(timeoutSeconds or AUDIO_DRAIN_TIMEOUT)
+
+    if debug then
+        print("[AUDIO] Waiting for final buffer drain: " .. tostring(label or "audio") .. " on " .. tostring(pendingCount) .. " speaker(s).")
+    end
+
+    while pendingCount > 0 do
+        if shouldContinue and not shouldContinue() then
+            return false, "cancelled"
+        end
+
+        local event, p1 = os.pullEvent()
+
+        if event == "speaker_audio_empty" then
+            if p1 == nil then
+                -- Older/weird versions may not provide the name. Treat as enough signal to continue.
+                if debug then print("[AUDIO] unnamed speaker_audio_empty event received.") end
+                return true
+            end
+
+            local name = tostring(p1)
+
+            if pending[name] then
+                pending[name] = nil
+                pendingCount = pendingCount - 1
+
+                if debug then
+                    print("[AUDIO] drained: " .. name .. " (" .. tostring(pendingCount) .. " left)")
+                end
+            end
+        elseif event == "peripheral" or event == "peripheral_detach" then
+            -- If the network changes mid-broadcast, do not deadlock waiting for old names.
+            if debug then print("[AUDIO] peripheral network changed while draining.") end
+            return false, "speaker network changed"
+        elseif event == "timer" and p1 == timer then
+            local missing = {}
+
+            for name, stillPending in pairs(pending) do
+                if stillPending then missing[#missing + 1] = name end
+            end
+
+            table.sort(missing)
+
+            return false, "Drain timeout waiting for: " .. table.concat(missing, ", ")
+        end
+    end
+
+    return true
+end
+
+local function hardStopAllSpeakers(reason, verbose)
+    scanSpeakers()
+
+    local count = 0
+
+    if verbose then
+        print("[AUDIO] Hard stop " .. tostring(reason or "") .. " across " .. tostring(#citySpeakers) .. " visible speaker(s).")
+    end
+
+    for pass = 1, HARD_STOP_PASSES do
+        for _, item in ipairs(citySpeakers) do
+            local ok = pcall(function()
+                item.speaker.stop()
+            end)
+
+            if ok and pass == 1 then
+                count = count + 1
+            end
+        end
+
+        sleep(HARD_STOP_GAP)
+    end
+
+    os.queueEvent("jarvis_audio_reset")
+
+    if verbose then
+        print("[AUDIO] Hard stop reached " .. tostring(count) .. " speaker(s).")
+    end
+
+    return count
+end
+
+local function resetAudioNetwork(reason)
+    local count = hardStopAllSpeakers(reason or "reset", true)
+
+    -- Give clients/server a small moment to process stop packets before new audio begins.
+    sleep(PRE_MUSIC_SETTLE_SECONDS)
+
+    return count
+end
+
 local function playOnAllSpeakers(sound, volume, pitch)
     if #citySpeakers == 0 then scanSpeakers() end
 
@@ -995,18 +1109,7 @@ local function playOnAllSpeakers(sound, volume, pitch)
 end
 
 local function stopAllSpeakers()
-    scanSpeakers()
-
-    local count = 0
-
-    for _, item in ipairs(citySpeakers) do
-        local ok = pcall(function()
-            item.speaker.stop()
-        end)
-
-        if ok then count = count + 1 end
-    end
-
+    local count = hardStopAllSpeakers("manual stop", false)
     print("Stopped " .. tostring(count) .. " speaker(s).")
 end
 
@@ -1105,6 +1208,21 @@ local function speakerFanoutDebug()
         print("Fanout test failed: " .. tostring(err))
     end
 
+    line()
+    print("")
+end
+
+
+local function speakerDrainDebug()
+    print("")
+    line()
+    print("AUDIO DRAIN / RESET DEBUG")
+    print("Visible speakers before reset: " .. tostring(speakerCount()))
+    print("Targeted speakers before reset: " .. tostring(activeSpeakerCount()))
+    resetAudioNetwork("diagnostic reset")
+    scanSpeakers()
+    print("Visible speakers after reset: " .. tostring(speakerCount()))
+    print("Targeted speakers after reset: " .. tostring(activeSpeakerCount()))
     line()
     print("")
 end
@@ -1271,6 +1389,8 @@ local function requestMusic(track)
         return false
     end
 
+    resetAudioNetwork("music request")
+
     musicState.stop = false
     musicState.playing = true
     musicState.token = musicState.token + 1
@@ -1308,6 +1428,7 @@ local function musicLoop()
             local track = musicState.current
             local token = musicState.token
 
+            resetAudioNetwork("music stream start")
             scanSpeakers()
             print("[MUSIC] Opening stream: " .. tostring(track.name))
             print("[MUSIC] Broadcasting to " .. tostring(activeSpeakerCount()) .. "/" .. tostring(speakerCount()) .. " visible speaker(s).")
@@ -1701,6 +1822,17 @@ local function speakToCity(text, debug, ttsInstructions)
         local ok, err = speakOneChunkToCity(chunk, debug, i, #chunks, ttsInstructions)
         if not ok then return false, err end
         if i < #chunks then sleep(0.12) end
+    end
+
+    local drained, drainErr = waitForTargetSpeakersEmpty("TTS final", AUDIO_DRAIN_TIMEOUT, debug, nil)
+
+    if not drained then
+        if debug then
+            print("[TTS] Drain warning: " .. tostring(drainErr))
+            print("[TTS] Forcing speaker reset after TTS.")
+        end
+
+        hardStopAllSpeakers("TTS drain recovery", debug)
     end
 
     return true, "spoken"
@@ -2122,9 +2254,11 @@ local function printMorningBroadcast(forced)
     print("")
 
     stopMusic("morning broadcast")
+    resetAudioNetwork("pre-morning TTS")
     playOnAllSpeakers("minecraft:block.note_block.chime", 1, 1.0)
     sleep(0.15)
     playOnAllSpeakers("minecraft:block.note_block.chime", 1, 1.25)
+    sleep(0.35)
 
     print("Composing fresh public broadcast...")
     local speech, err = generateMorningBroadcast(c, forced)
@@ -2144,9 +2278,9 @@ local function printMorningBroadcast(forced)
     end
 
     print("")
-    print("Resetting speaker buffers before music fanout...")
-    stopAllSpeakers()
-    sleep(0.35)
+    print("Draining and resetting speaker buffers before music fanout...")
+    waitForTargetSpeakersEmpty("morning TTS before music", AUDIO_DRAIN_TIMEOUT, true, nil)
+    resetAudioNetwork("pre-music")
     print("Selecting daily patriotic music through JARVIS...")
     playRandomMusic()
 
@@ -2236,6 +2370,7 @@ local function bootScreen()
     print("  testspk     - play test chime on active speakers")
     print("  testeach    - test every speaker one by one")
     print("  spfanout    - test raw audio fanout to all visible speakers")
+    print("  spreset     - hard reset/clear every speaker buffer")
     print("  spbase      - save current speaker map")
     print("  spdiff      - compare current speakers to saved map")
     print("  spoffmiss   - disable speakers missing from saved map")
@@ -2309,6 +2444,9 @@ local function chatLoop()
 
             elseif lower == "spfanout" or lower == "speakerfanout" then
                 speakerFanoutDebug()
+
+            elseif lower == "spreset" or lower == "speakerreset" or lower == "audioreset" then
+                speakerDrainDebug()
 
             elseif lower == "spbase" or lower == "speakerbase" or lower == "speaker baseline" then
                 saveSpeakerBaseline()
