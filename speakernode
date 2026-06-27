@@ -16,7 +16,7 @@
 --   3. Attach one speaker directly OR attach a small local wired speaker branch.
 --   4. Run this script as startup.
 
-local VERSION = "2.1.0-dumb-node-synced-start"
+local VERSION = "2.1.1-dumb-node-synced-checked"
 local PROTOCOL = "JARVIS_PA_V1"
 
 local NODE_LABEL = os.getComputerLabel() or ("SpeakerNode-" .. tostring(os.getComputerID()))
@@ -261,7 +261,7 @@ local function clearStream(streamId)
     end
 end
 
-local function enqueueAudiolocal function enqueueAudio(msg)
+local function enqueueAudio(msg)
     local streamId = tostring(msg.stream_id or "default")
 
     if currentStreamId ~= streamId then
@@ -415,7 +415,7 @@ for i, item in ipairs(localSpeakers) do
     print("  " .. tostring(i) .. ". " .. tostring(item.name))
 end
 print("Waiting for raw audio packets from JARVIS...")
-print("Sync mode: prebuffer until stream_play, then local speakers start.")
+print("Sync mode: prebuffer first audio, wait for stream_play, then start.")
 print("")
 
 parallel.waitForAny(listenerLoop, audioWorkerLoop, commandLoop)
