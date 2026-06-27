@@ -12,7 +12,7 @@
 --   - Put JarvisKey.lua on this computer if you want OpenAI TTS on the node.
 --   - If no key exists, it falls back to legacy music.madefor.cc TTS.
 
-local VERSION = "1.1.1-multi-speaker-node-hastype-fix"
+local VERSION = "1.1.2-node-cancel-token-fix"
 
 -- =============================================================================
 -- CONFIG
@@ -544,16 +544,23 @@ local function speakText(text, voice, volume, language, token)
             return false, "cancelled"
         end
 
-        local ok, err = speakOpenAI(chunk, voice, volume, instructions, token)
+        local ok, err
 
-        if not ok then
-            print("[TTS] OpenAI failed: " .. tostring(err))
-            print("[TTS] Trying legacy fallback...")
-            ok, err = speakLegacy(chunk, volume, token)
+        if API_KEY then
+            ok, err = speakOpenAI(chunk, voice, volume, instructions, token)
 
             if not ok then
-                return false, err
+                print("[TTS] OpenAI failed: " .. tostring(err))
+                print("[TTS] Trying legacy fallback...")
+                ok, err = speakLegacy(chunk, volume, token)
             end
+        else
+            print("[TTS] No OpenAI key on node; using legacy fallback.")
+            ok, err = speakLegacy(chunk, volume, token)
+        end
+
+        if not ok then
+            return false, err
         end
 
         sleep(0.05)
@@ -622,9 +629,14 @@ local function ack(to, commandId, ok, status, extra)
 end
 
 local function setJob(job)
+    -- Important:
+    -- Increment cancellation token first, then stamp the new job with the new token.
+    -- Previous builds passed the old token into the job before incrementing, so every
+    -- fresh speak/music job immediately saw itself as cancelled.
     cancelToken = cancelToken + 1
     stopAudio()
 
+    job.token = cancelToken
     currentJob = job
     os.queueEvent("jarvis_node_job")
 end
@@ -658,7 +670,6 @@ local function listenerLoop()
                     voice = msg.voice or DEFAULT_VOICE,
                     volume = msg.volume or TTS_VOLUME,
                     language = msg.language or "normal",
-                    token = cancelToken,
                 })
 
                 ack(sender, msg.command_id, true, "speak queued")
@@ -671,7 +682,6 @@ local function listenerLoop()
                     url = tostring(msg.url or ""),
                     name = tostring(msg.name or "track"),
                     volume = msg.volume or MUSIC_VOLUME,
-                    token = cancelToken,
                 })
 
                 ack(sender, msg.command_id, true, "music queued")
